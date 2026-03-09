@@ -17,7 +17,7 @@ import subprocess
 from types import SimpleNamespace
 
 import pytest
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.testing_utils import torch_device
 
 from trl.generation.vllm_client import VLLMClient
@@ -172,6 +172,31 @@ class TestVLLMClientServer(TrlTestCase):
         # Check that the number of sequences are equal to the number of messages
         assert len(prompt_ids) == len(messages)
         assert len(completion_ids) == len(messages)
+
+        # Check that the sequences are lists of integers
+        for seq in prompt_ids:
+            assert all(isinstance(tok, int) for tok in seq)
+        for seq in completion_ids:
+            assert all(isinstance(tok, int) for tok in seq)
+
+    def test_generate_with_token_ids(self):
+        tokenizer = AutoTokenizer.from_pretrained(self.model_id)
+        prompts = ["Hello, AI!", "Tell me a joke"]
+        prompt_token_ids = tokenizer(prompts)["input_ids"]
+        outputs = self.client.generate(prompt_token_ids)
+        prompt_ids = outputs["prompt_ids"]
+        completion_ids = outputs["completion_ids"]
+
+        # Check that the outputs are lists
+        assert isinstance(prompt_ids, list)
+        assert isinstance(completion_ids, list)
+
+        # Check that the number of sequences are equal to the number of prompts
+        assert len(prompt_ids) == len(prompts)
+        assert len(completion_ids) == len(prompts)
+
+        # Check that prompt_ids match the input token IDs
+        assert prompt_ids == prompt_token_ids
 
         # Check that the sequences are lists of integers
         for seq in prompt_ids:
@@ -361,6 +386,31 @@ class TestVLLMClientServerBaseURL(TrlTestCase):
         for seq in completion_ids:
             assert all(isinstance(tok, int) for tok in seq)
 
+    def test_generate_with_token_ids(self):
+        tokenizer = AutoTokenizer.from_pretrained(self.model_id)
+        prompts = ["Hello, AI!", "Tell me a joke"]
+        prompt_token_ids = tokenizer(prompts)["input_ids"]
+        outputs = self.client.generate(prompt_token_ids)
+        prompt_ids = outputs["prompt_ids"]
+        completion_ids = outputs["completion_ids"]
+
+        # Check that the outputs are lists
+        assert isinstance(prompt_ids, list)
+        assert isinstance(completion_ids, list)
+
+        # Check that the number of sequences are equal to the number of prompts
+        assert len(prompt_ids) == len(prompts)
+        assert len(completion_ids) == len(prompts)
+
+        # Check that prompt_ids match the input token IDs
+        assert prompt_ids == prompt_token_ids
+
+        # Check that the sequences are lists of integers
+        for seq in prompt_ids:
+            assert all(isinstance(tok, int) for tok in seq)
+        for seq in completion_ids:
+            assert all(isinstance(tok, int) for tok in seq)
+
     def test_generate_with_params(self):
         prompts = ["Hello, AI!", "Tell me a joke"]
         completion_ids = self.client.generate(prompts, n=2, repetition_penalty=0.9, temperature=0.8, max_tokens=32)[
@@ -464,6 +514,51 @@ class TestVLLMClientServerTP(TrlTestCase):
         for seq in completion_ids:
             assert all(isinstance(tok, int) for tok in seq)
 
+    def test_generate_with_token_ids(self):
+        tokenizer = AutoTokenizer.from_pretrained(self.model_id)
+        prompts = ["Hello, AI!", "Tell me a joke"]
+        prompt_token_ids = tokenizer(prompts)["input_ids"]
+        outputs = self.client.generate(prompt_token_ids)
+        prompt_ids = outputs["prompt_ids"]
+        completion_ids = outputs["completion_ids"]
+
+        # Check that the outputs are lists
+        assert isinstance(prompt_ids, list)
+        assert isinstance(completion_ids, list)
+
+        # Check that the number of sequences are equal to the number of prompts
+        assert len(prompt_ids) == len(prompts)
+        assert len(completion_ids) == len(prompts)
+
+        # Check that prompt_ids match the input token IDs
+        assert prompt_ids == prompt_token_ids
+
+        # Check that the sequences are lists of integers
+        for seq in prompt_ids:
+            assert all(isinstance(tok, int) for tok in seq)
+        for seq in completion_ids:
+            assert all(isinstance(tok, int) for tok in seq)
+
+    def test_generate_with_params(self):
+        prompts = ["Hello, AI!", "Tell me a joke"]
+        completion_ids = self.client.generate(prompts, n=2, repetition_penalty=0.9, temperature=0.8, max_tokens=32)[
+            "completion_ids"
+        ]
+
+        # Check that the output is a list
+        assert isinstance(completion_ids, list)
+
+        # Check that the number of generated sequences is 2 times the number of prompts
+        assert len(completion_ids) == 2 * len(prompts)
+
+        # Check that the generated sequences are lists of integers
+        for seq in completion_ids:
+            assert all(isinstance(tok, int) for tok in seq)
+
+        # Check that the length of the generated sequences is less than or equal to 32
+        for seq in completion_ids:
+            assert len(seq) <= 32
+
     def test_update_model_params(self):
         model = AutoModelForCausalLM.from_pretrained(self.model_id, device_map=torch_device)
         self.client.update_model_params(model)
@@ -546,6 +641,51 @@ class TestVLLMClientServerDP(TrlTestCase):
             assert all(isinstance(tok, int) for tok in seq)
         for seq in completion_ids:
             assert all(isinstance(tok, int) for tok in seq)
+
+    def test_generate_with_token_ids(self):
+        tokenizer = AutoTokenizer.from_pretrained(self.model_id)
+        prompts = ["Hello, AI!", "Tell me a joke"]
+        prompt_token_ids = tokenizer(prompts)["input_ids"]
+        outputs = self.client.generate(prompt_token_ids)
+        prompt_ids = outputs["prompt_ids"]
+        completion_ids = outputs["completion_ids"]
+
+        # Check that the outputs are lists
+        assert isinstance(prompt_ids, list)
+        assert isinstance(completion_ids, list)
+
+        # Check that the number of sequences are equal to the number of prompts
+        assert len(prompt_ids) == len(prompts)
+        assert len(completion_ids) == len(prompts)
+
+        # Check that prompt_ids match the input token IDs
+        assert prompt_ids == prompt_token_ids
+
+        # Check that the sequences are lists of integers
+        for seq in prompt_ids:
+            assert all(isinstance(tok, int) for tok in seq)
+        for seq in completion_ids:
+            assert all(isinstance(tok, int) for tok in seq)
+
+    def test_generate_with_params(self):
+        prompts = ["Hello, AI!", "Tell me a joke"]
+        completion_ids = self.client.generate(prompts, n=2, repetition_penalty=0.9, temperature=0.8, max_tokens=32)[
+            "completion_ids"
+        ]
+
+        # Check that the output is a list
+        assert isinstance(completion_ids, list)
+
+        # Check that the number of generated sequences is 2 times the number of prompts
+        assert len(completion_ids) == 2 * len(prompts)
+
+        # Check that the generated sequences are lists of integers
+        for seq in completion_ids:
+            assert all(isinstance(tok, int) for tok in seq)
+
+        # Check that the length of the generated sequences is less than or equal to 32
+        for seq in completion_ids:
+            assert len(seq) <= 32
 
     def test_update_model_params(self):
         model = AutoModelForCausalLM.from_pretrained(self.model_id, device_map=torch_device)
