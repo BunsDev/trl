@@ -464,11 +464,14 @@ class AsyncRolloutWorker:
             completion_ids=group.completions_ids,
             **group.reward_kwargs,
         )
-        all_rewards = await asyncio.gather(*[
-            reward_func(**kwargs) if inspect.iscoroutinefunction(reward_func)
-            else asyncio.to_thread(reward_func, **kwargs)
-            for reward_func in self.reward_funcs
-        ])
+        all_rewards = await asyncio.gather(
+            *[
+                reward_func(**kwargs)
+                if inspect.iscoroutinefunction(reward_func)
+                else asyncio.to_thread(reward_func, **kwargs)
+                for reward_func in self.reward_funcs
+            ]
+        )
 
         # Sum rewards across all reward functions. Reward functions may return None for individual
         # samples (e.g. accuracy_reward when the gold solution is unparseable). Convert None → nan
