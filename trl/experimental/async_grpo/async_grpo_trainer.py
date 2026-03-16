@@ -217,6 +217,7 @@ class AsyncGRPOTrainer(Trainer):
                 max_tokens=self.args.max_completion_length,
                 temperature=self.args.temperature,
                 request_timeout=self.args.request_timeout,
+                server_ready_timeout=self.args.vllm_server_timeout,
                 chat_template_kwargs=self.args.chat_template_kwargs,
                 log_completions=self.args.log_completions,
                 num_completions_to_print=self.args.num_completions_to_print,

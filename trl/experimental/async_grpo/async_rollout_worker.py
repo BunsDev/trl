@@ -89,6 +89,7 @@ class AsyncRolloutWorker:
         max_tokens: int = 32,
         temperature: float = 1.0,
         request_timeout: int = 120,
+        server_ready_timeout: float = 300.0,
         chat_template_kwargs: dict[str, Any] | None = None,
         log_completions: bool = False,
         num_completions_to_print: int = 3,
@@ -129,6 +130,7 @@ class AsyncRolloutWorker:
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.request_timeout = request_timeout
+        self.server_ready_timeout = server_ready_timeout
         self.chat_template_kwargs = chat_template_kwargs or {}
         self.log_completions = log_completions
         self.num_completions_to_print = num_completions_to_print
@@ -152,7 +154,7 @@ class AsyncRolloutWorker:
 
         async with aiohttp.ClientSession() as session:
             self.session = session
-            await self._wait_for_server_ready(stop_event=stop_event)
+            await self._wait_for_server_ready(stop_event=stop_event, timeout_s=self.server_ready_timeout)
             if stop_event.is_set():
                 return
             logger.info(
@@ -422,9 +424,9 @@ class AsyncRolloutWorker:
         n_failures = 0
         for tool_call in tool_calls:
             n_calls += 1
+            function = tool_call["function"]
+            name = function["name"]
             try:
-                function = tool_call["function"]
-                name = function["name"]
                 arguments = function.get("arguments", {})
                 result = tool_dict[name](**arguments)
             except Exception as error:
