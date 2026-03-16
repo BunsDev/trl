@@ -99,6 +99,7 @@ class AsyncRolloutWorker:
         self._dataset_iter = iter(dataset)
         self.rollout_buffer = rollout_buffer
         self.reward_funcs = reward_funcs
+        self.reward_func_names = [f.__name__ for f in reward_funcs]
         self.num_generations = num_generations
         self.max_inflight_tasks = max_inflight_tasks
         self.environments = None
@@ -298,7 +299,7 @@ class AsyncRolloutWorker:
             except TimeoutError:
                 continue
 
-            samples = await asyncio.to_thread(self._score_group, group)
+            samples = await self._score_group(group)
 
             # Compute tok/s before pushing so the metric is included in each sample.
             group_tokens = sum(sum(sample.completion_mask) for sample in samples)
@@ -455,17 +456,19 @@ class AsyncRolloutWorker:
         completion_logprobs = choice["logprobs"]["token_logprobs"]
         return completion_ids, completion_logprobs
 
-    def _score_group(self, group: RolloutGroup) -> list[RolloutSample] | None:
-        all_rewards = []
-        for reward_func in self.reward_funcs:
-            rewards = reward_func(
-                completions=group.completions,
-                prompt=group.prompt,
-                prompts=[group.prompt] * len(group.completions),
-                completion_ids=group.completions_ids,
-                **group.reward_kwargs,
-            )
-            all_rewards.append(rewards)
+    async def _score_group(self, group: RolloutGroup) -> list[RolloutSample] | None:
+        kwargs = dict(
+            completions=group.completions,
+            prompt=group.prompt,
+            prompts=[group.prompt] * len(group.completions),
+            completion_ids=group.completions_ids,
+            **group.reward_kwargs,
+        )
+        all_rewards = await asyncio.gather(*[
+            reward_func(**kwargs) if inspect.iscoroutinefunction(reward_func)
+            else asyncio.to_thread(reward_func, **kwargs)
+            for reward_func in self.reward_funcs
+        ])
 
         # Sum rewards across all reward functions. Reward functions may return None for individual
         # samples (e.g. accuracy_reward when the gold solution is unparseable). Convert None → nan
@@ -493,6 +496,8 @@ class AsyncRolloutWorker:
             else [{}] * len(group.completions)
         )
 
+        per_func_rewards = np.array(all_rewards, dtype=float)  # shape (num_funcs, num_completions)
+
         return [
             RolloutSample(
                 prompt=group.prompt,
@@ -502,17 +507,27 @@ class AsyncRolloutWorker:
                 old_log_probs=[0.0] * len(group.prompt_ids) + logprobs,
                 advantage=advantage,
                 model_version=group.model_version,
-                metrics={"reward": float(reward), "reward_std": reward_std, **tm},
+                metrics={
+                    "reward": float(reward),
+                    "reward_std": reward_std,
+                    **{
+                        f"rewards/{name}": float(func_reward)
+                        for name, func_reward in zip(self.reward_func_names, per_func_rewards[:, i], strict=True)
+                    },
+                    **tm,
+                },
             )
-            for completion, completion_ids, logprobs, tool_mask, advantage, reward, tm in zip(
-                group.completions,
-                group.completions_ids,
-                group.completions_logprobs,
-                group.tool_mask,
-                advantages,
-                rewards,
-                tool_metrics,
-                strict=True,
+            for i, (completion, completion_ids, logprobs, tool_mask, advantage, reward, tm) in enumerate(
+                zip(
+                    group.completions,
+                    group.completions_ids,
+                    group.completions_logprobs,
+                    group.tool_mask,
+                    advantages,
+                    rewards,
+                    tool_metrics,
+                    strict=True,
+                )
             )
         ]
 
