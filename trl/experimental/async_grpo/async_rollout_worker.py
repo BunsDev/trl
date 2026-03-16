@@ -1,0 +1,545 @@
+# Copyright 2020-2026 The HuggingFace Team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import asyncio
+import inspect
+import queue
+import time
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+from typing import Any, TypeAlias
+
+import aiohttp
+import numpy as np
+from accelerate.logging import get_logger
+from datasets import Dataset
+from transformers import AutoTokenizer
+
+from trl.chat_template_utils import (
+    add_response_schema,
+    get_training_chat_template,
+    parse_response,
+)
+from trl.trainer.utils import print_prompt_completions_sample
+
+
+logger = get_logger(__name__)
+
+Prompt: TypeAlias = list[dict[str, str]]
+
+
+@dataclass(slots=True)
+class RolloutGroup:
+    """Single GRPO group for one prompt with multiple completions."""
+
+    prompt: Prompt
+    prompt_ids: list[int]
+    reward_kwargs: dict[str, list[Any]]
+    completions: list[list[dict[str, str]]]
+    completions_ids: list[list[int]]
+    completions_logprobs: list[list[float]]
+    tool_mask: list[list[int]]
+    tool_call_counts: list[int]
+    tool_failure_counts: list[int]
+    model_version: int
+
+
+@dataclass(slots=True)
+class RolloutSample:
+    prompt: Prompt
+    input_ids: list[int]
+    completion: list[dict[str, str]]
+    completion_mask: list[int]
+    old_log_probs: list[float]
+    advantage: float
+    model_version: int
+    metrics: dict[str, float]  # logging metadata only, not used in loss computation
+
+
+class AsyncRolloutWorker:
+    """
+    Minimal async actor worker structure.
+
+    Loop:
+        generate groups -> score groups -> push samples -> repeat
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        dataset: Dataset,
+        rollout_buffer: queue.Queue[RolloutSample],
+        reward_funcs: list[Callable[..., list[float]]],
+        tools: list[Callable] | None = None,
+        environment_factory: Callable[[], object] | None = None,
+        num_generations: int = 8,
+        max_inflight_tasks: int = 8,
+        vllm_server_url: str = "http://localhost:8000",
+        max_tokens: int = 32,
+        temperature: float = 1.0,
+        request_timeout: int = 120,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        log_completions: bool = False,
+        num_completions_to_print: int = 3,
+    ):
+        self.model_name = model_name
+        self.dataset = dataset
+        self._dataset_iter = iter(dataset)
+        self.rollout_buffer = rollout_buffer
+        self.reward_funcs = reward_funcs
+        self.num_generations = num_generations
+        self.max_inflight_tasks = max_inflight_tasks
+        self.environments = None
+        environment_methods = [[] for _ in range(self.max_inflight_tasks)]
+        if environment_factory is not None:
+            self.environments = [environment_factory() for _ in range(self.max_inflight_tasks)]
+            for i, environment in enumerate(self.environments):
+                has_reset = False
+                for name, member in inspect.getmembers(environment, predicate=inspect.ismethod):
+                    if name == "reset":
+                        has_reset = True
+                    elif not name.startswith("_"):
+                        environment_methods[i].append(member)
+                if not has_reset:
+                    raise ValueError(
+                        "Each environment instance returned by `environment_factory` must define `reset`."
+                    )
+
+        base_tools = tools or []
+        self._sync_tool_dicts = [{} for _ in range(self.max_inflight_tasks)]
+        for i in range(self.max_inflight_tasks):
+            for tool in base_tools + (environment_methods[i] if self.environments is not None else []):
+                if inspect.iscoroutinefunction(tool):
+                    raise ValueError("Async tools are not supported in AsyncRolloutWorker yet.")
+                self._sync_tool_dicts[i][tool.__name__] = tool
+        self.tools = base_tools + (environment_methods[0] if self.environments is not None else [])
+
+        self.vllm_server_url = vllm_server_url.rstrip("/")
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.request_timeout = request_timeout
+        self.chat_template_kwargs = chat_template_kwargs or {}
+        self.log_completions = log_completions
+        self.num_completions_to_print = num_completions_to_print
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer = add_response_schema(self.tokenizer)
+        self.chat_template = get_training_chat_template(self.tokenizer)
+
+        self._groups_to_score: asyncio.Queue[RolloutGroup] = asyncio.Queue(maxsize=16)
+        self._total_completion_tokens = 0
+        self._total_groups_scored = 0
+        self._generation_start_time: float | None = None
+        self.model_version = 0
+        self.session = None
+
+    def update_model_version(self, model_version: int):
+        self.model_version = model_version
+
+    async def run(self, stop_event: asyncio.Event | None = None) -> None:
+        if stop_event is None:
+            stop_event = asyncio.Event()
+
+        async with aiohttp.ClientSession() as session:
+            self.session = session
+            await self._wait_for_server_ready(stop_event=stop_event)
+            if stop_event.is_set():
+                return
+            logger.info(
+                f"vllm worker started: num_generations={self.num_generations}, max_inflight_tasks={self.max_inflight_tasks}"
+            )
+
+            await asyncio.gather(
+                asyncio.create_task(self._generate_loop(stop_event=stop_event)),
+                asyncio.create_task(self._score_loop(stop_event=stop_event)),
+            )
+
+    async def _wait_for_server_ready(
+        self,
+        stop_event: asyncio.Event,
+        timeout_s: float = 600.0,
+        poll_interval_s: float = 2.0,
+    ) -> None:
+        """Block startup until the vLLM server exposes the custom trainer endpoints."""
+        logger.info(f"Waiting for vLLM server at {self.vllm_server_url} ...")
+        start = asyncio.get_running_loop().time()
+        while not stop_event.is_set():
+            elapsed = asyncio.get_running_loop().time() - start
+            try:
+                status_code = await self._get_status_code("/health", 5)
+                if status_code == 200:
+                    logger.info(f"vLLM server ready after {elapsed:.1f}s")
+                    return
+            except aiohttp.ClientError:
+                pass
+
+            if elapsed >= timeout_s:
+                raise TimeoutError(f"Timed out waiting for vLLM server readiness at {self.vllm_server_url}")
+            if int(elapsed) % 10 < poll_interval_s:
+                logger.info(f"Still waiting for vLLM server... ({elapsed:.0f}s)")
+            await asyncio.sleep(poll_interval_s)
+
+    async def _generate_loop(self, stop_event: asyncio.Event) -> None:
+        pending_groups: dict[int, RolloutGroup] = {}
+        pending_completed: dict[int, int] = {}
+        inflight_tasks: dict[asyncio.Task, tuple[int, int]] = {}
+        free_slots = set(range(self.max_inflight_tasks))
+        work_iter = self._repeat_iterator()
+
+        try:
+            while True:
+                while free_slots and not stop_event.is_set():
+                    group_id, row = next(work_iter)
+                    if group_id not in pending_groups:
+                        prompt = row["prompt"]
+                        prompt_ids = self.tokenizer.apply_chat_template(
+                            prompt,
+                            return_dict=False,
+                            add_generation_prompt=True,
+                            tools=self.tools,
+                            chat_template=self.chat_template,
+                            **self.chat_template_kwargs,
+                        )
+                        reward_kwargs = {
+                            key: [row[key]] * self.num_generations
+                            for key in row
+                            if key not in {"prompt", "completion", "completion_ids"}
+                        }
+                        pending_groups[group_id] = RolloutGroup(
+                            prompt=prompt,
+                            prompt_ids=prompt_ids,
+                            reward_kwargs=reward_kwargs,
+                            completions=[],
+                            completions_ids=[],
+                            completions_logprobs=[],
+                            tool_mask=[],
+                            tool_call_counts=[],
+                            tool_failure_counts=[],
+                            model_version=self.model_version,
+                        )
+                        pending_completed[group_id] = 0
+                        logger.debug(f"Started group {group_id}; pending_groups={len(pending_groups)}")
+
+                    slot = free_slots.pop()
+                    if self.environments is not None:
+                        # Current assumption: reset side effects matter, return value is ignored.
+                        self.environments[slot].reset(**row)
+
+                    logger.info(f"[slot] assigned slot={slot} group={group_id} free_after={len(free_slots)}")
+                    task = asyncio.create_task(
+                        self._generate_one(
+                            pending_groups[group_id].prompt,
+                            tool_dict=self._sync_tool_dicts[slot],
+                        )
+                    )
+                    inflight_tasks[task] = (group_id, slot)
+
+                if not inflight_tasks:
+                    if stop_event.is_set():
+                        return
+                    await asyncio.sleep(0.01)
+                    continue
+
+                done, _ = await asyncio.wait(inflight_tasks, return_when=asyncio.FIRST_COMPLETED, timeout=0.1)
+                if not done:
+                    continue
+
+                for task in done:
+                    group_id, slot = inflight_tasks.pop(task)
+                    free_slots.add(slot)
+                    logger.debug(f"[slot] freed   slot={slot} group={group_id} free_after={len(free_slots)}")
+                    (
+                        completion,
+                        completion_ids,
+                        completion_logprobs,
+                        tool_mask,
+                        tool_call_count,
+                        tool_failure_count,
+                    ) = task.result()
+                    group = pending_groups[group_id]
+                    group.completions.append(completion)
+                    group.completions_ids.append(completion_ids)
+                    group.completions_logprobs.append(completion_logprobs)
+                    group.tool_mask.append(tool_mask)
+                    group.tool_call_counts.append(tool_call_count)
+                    group.tool_failure_counts.append(tool_failure_count)
+                    pending_completed[group_id] += 1
+
+                    if pending_completed[group_id] == self.num_generations:
+                        await self._groups_to_score.put(group)
+                        logger.debug(
+                            f"Group {group_id} complete; queued_for_scoring={self._groups_to_score.qsize()}"
+                        )
+                        del pending_groups[group_id]
+                        del pending_completed[group_id]
+        finally:
+            for task in inflight_tasks:
+                task.cancel()
+            if inflight_tasks:
+                await asyncio.gather(*inflight_tasks, return_exceptions=True)
+
+    async def _score_loop(self, stop_event: asyncio.Event) -> None:
+        while True:
+            if stop_event.is_set() and self._groups_to_score.empty():
+                return
+
+            try:
+                group = await asyncio.wait_for(self._groups_to_score.get(), timeout=0.1)
+            except TimeoutError:
+                continue
+
+            samples = await asyncio.to_thread(self._score_group, group)
+
+            # Compute tok/s before pushing so the metric is included in each sample.
+            group_tokens = sum(sum(sample.completion_mask) for sample in samples)
+            self._total_completion_tokens += group_tokens
+            if self._generation_start_time is None:
+                self._generation_start_time = time.monotonic()
+            elapsed = time.monotonic() - self._generation_start_time
+            tok_per_sec = self._total_completion_tokens / elapsed if elapsed > 0 else 0.0
+            for sample in samples:
+                sample.metrics["tok/s"] = tok_per_sec
+
+            if self.log_completions and samples:
+                print_prompt_completions_sample(
+                    prompts=[s.prompt for s in samples],
+                    completions=[s.completion for s in samples],
+                    rewards={"reward": [s.metrics["reward"] for s in samples]},
+                    advantages=[s.advantage for s in samples],
+                    step=self._total_groups_scored,
+                    num_samples=self.num_completions_to_print,
+                )
+            self._total_groups_scored += 1
+
+            for sample in samples:
+                while True:
+                    try:
+                        self.rollout_buffer.put_nowait(sample)
+                        break
+                    except queue.Full:
+                        if stop_event.is_set():
+                            return
+                        # Wait for trainer to consume loop
+                        logger.debug("Rollout buffer full, waiting for free slot...")
+                        await asyncio.sleep(0.1)
+
+            buffer_qsize = self.rollout_buffer.qsize()
+            for sample in samples:
+                sample.metrics["buffer_qsize"] = buffer_qsize
+
+            logger.debug(
+                f"Scored group with {len(samples)} samples; rollout_buffer_qsize={self.rollout_buffer.qsize()}"
+            )
+            logger.info(
+                f"[inference] total_completion_tokens={self._total_completion_tokens}, tok/s={tok_per_sec:.1f}"
+            )
+
+    def _repeat_iterator(self) -> Iterator[tuple[int, dict[str, Any]]]:
+        group_id = 0
+        while True:
+            try:
+                row = next(self._dataset_iter)
+            except StopIteration:
+                self._dataset_iter = iter(self.dataset)
+                row = next(self._dataset_iter)
+            for _ in range(self.num_generations):
+                yield group_id, row
+            group_id += 1
+
+    async def _generate_one(
+        self, prompt: Prompt, tool_dict: dict[str, Callable]
+    ) -> tuple[list[dict[str, str]], list[int], list[float], list[int], int, int]:
+        completion, completion_ids, completion_logprobs, tool_mask = [], [], [], []
+        tool_call_count = 0
+        tool_failure_count = 0
+        prompt_ids = self.tokenizer.apply_chat_template(
+            prompt,
+            return_dict=False,
+            add_generation_prompt=True,
+            tools=self.tools,
+            chat_template=self.chat_template,
+            **self.chat_template_kwargs,
+        )
+        while True:
+            turn_ids, turn_logprobs = await self._generate_one_turn(prompt_ids)
+            assistant_message = parse_response(self.tokenizer, turn_ids)
+            completion.append(assistant_message)
+            completion_ids.extend(turn_ids)
+            completion_logprobs.extend(turn_logprobs)
+            tool_mask.extend([1] * len(turn_ids))
+            tool_calls = assistant_message.get("tool_calls")
+            if tool_calls is None:
+                return completion, completion_ids, completion_logprobs, tool_mask, tool_call_count, tool_failure_count
+
+            tool_messages, n_calls, n_failures = self._execute_tool_calls(tool_calls, tool_dict)
+            tool_call_count += n_calls
+            tool_failure_count += n_failures
+            completion.extend(tool_messages)
+            tool_suffix_ids = self._build_messages_suffix_ids(tool_messages)
+            completion_ids.extend(tool_suffix_ids)
+            completion_logprobs.extend([0.0] * len(tool_suffix_ids))
+            tool_mask.extend([0] * len(tool_suffix_ids))
+            prompt_ids = prompt_ids + turn_ids + tool_suffix_ids
+
+    def _build_messages_suffix_ids(self, messages: list[dict[str, Any]]) -> list[int]:
+        template_messages = [
+            {"role": "user", "content": ""},
+            {"role": "assistant", "content": ""},
+        ]
+        prefix_ids = self.tokenizer.apply_chat_template(
+            template_messages,
+            return_dict=False,
+            tools=self.tools,
+            chat_template=self.chat_template,
+            **self.chat_template_kwargs,
+        )
+        prefix_and_messages_ids = self.tokenizer.apply_chat_template(
+            template_messages + messages,
+            return_dict=False,
+            chat_template=self.chat_template,
+            add_generation_prompt=True,
+            tools=self.tools,
+            **self.chat_template_kwargs,
+        )
+        prefix_len = len(prefix_ids)
+        if prefix_and_messages_ids[:prefix_len] != prefix_ids:
+            raise ValueError("Failed to construct message suffix in token space.")
+        return prefix_and_messages_ids[prefix_len:]
+
+    def _execute_tool_calls(
+        self, tool_calls: list[dict[str, Any]], tool_dict: dict[str, Callable]
+    ) -> tuple[list[dict[str, str]], int, int]:
+        tool_messages = []
+        n_calls = 0
+        n_failures = 0
+        for tool_call in tool_calls:
+            n_calls += 1
+            try:
+                function = tool_call["function"]
+                name = function["name"]
+                arguments = function.get("arguments", {})
+                result = tool_dict[name](**arguments)
+            except Exception as error:
+                n_failures += 1
+                result = {"error": str(error)}
+            tool_messages.append({"role": "tool", "name": name, "content": str(result)})
+        return tool_messages, n_calls, n_failures
+
+    async def _generate_one_turn(self, prompt_ids: list[int]) -> tuple[list[int], list[float]]:
+        payload = {
+            "model": self.model_name,
+            "prompt": prompt_ids,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "n": 1,
+            "return_token_ids": True,
+            "logprobs": 1,
+        }
+        while True:
+            try:
+                output = await self._post("/v1/completions", payload, self.request_timeout)
+                break
+            except (aiohttp.ServerDisconnectedError, aiohttp.ClientConnectionError):
+                # vLLM drops connections during weight sync (/pause). Wait briefly and retry.
+                logger.debug("Server disconnected (likely weight sync pause), retrying...")
+                await asyncio.sleep(1.0)
+        choice = output["choices"][0]
+        completion_ids = choice["token_ids"]
+        completion_logprobs = choice["logprobs"]["token_logprobs"]
+        return completion_ids, completion_logprobs
+
+    def _score_group(self, group: RolloutGroup) -> list[RolloutSample] | None:
+        all_rewards = []
+        for reward_func in self.reward_funcs:
+            rewards = reward_func(
+                completions=group.completions,
+                prompt=group.prompt,
+                prompts=[group.prompt] * len(group.completions),
+                completion_ids=group.completions_ids,
+                **group.reward_kwargs,
+            )
+            all_rewards.append(rewards)
+
+        # Sum rewards across all reward functions. Reward functions may return None for individual
+        # samples (e.g. accuracy_reward when the gold solution is unparseable). Convert None → nan
+        # and use nansum so that a None from one function doesn't affect the others, matching TRL.
+        all_rewards = [[r if r is not None else float("nan") for r in row] for row in all_rewards]
+        rewards = np.nansum(np.array(all_rewards, dtype=float), axis=0)
+        advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+        reward_mean = float(rewards.mean())
+        reward_std = float(rewards.std())
+        logger.info(f"Rollout metrics: reward_mean={reward_mean:.4f}, reward_std={reward_std:.4f}")
+
+        # tools/call_frequency: mean calls per completion (matches TRL's total_calls / num_completions)
+        # tools/failure_frequency: per-completion failure rate; averaged across samples in compute_loss
+        #   (TRL uses total_failures / total_calls, ours weights equally per completion — close enough)
+        total_calls = sum(group.tool_call_counts)
+        tool_metrics = (
+            [
+                {
+                    "tools/call_frequency": float(n_calls),
+                    "tools/failure_frequency": (n_failures / n_calls) if n_calls > 0 else 0.0,
+                }
+                for n_calls, n_failures in zip(group.tool_call_counts, group.tool_failure_counts, strict=True)
+            ]
+            if total_calls > 0
+            else [{}] * len(group.completions)
+        )
+
+        return [
+            RolloutSample(
+                prompt=group.prompt,
+                input_ids=group.prompt_ids + completion_ids,
+                completion=completion,
+                completion_mask=[0] * len(group.prompt_ids) + tool_mask,
+                old_log_probs=[0.0] * len(group.prompt_ids) + logprobs,
+                advantage=advantage,
+                model_version=group.model_version,
+                metrics={"reward": float(reward), "reward_std": reward_std, **tm},
+            )
+            for completion, completion_ids, logprobs, tool_mask, advantage, reward, tm in zip(
+                group.completions,
+                group.completions_ids,
+                group.completions_logprobs,
+                group.tool_mask,
+                advantages,
+                rewards,
+                tool_metrics,
+                strict=True,
+            )
+        ]
+
+    async def _post(self, path: str, payload: dict, timeout: int, max_retries: int = 3) -> dict:
+        for attempt in range(max_retries):
+            try:
+                async with self.session.post(
+                    f"{self.vllm_server_url}{path}", json=payload, timeout=timeout
+                ) as response:
+                    response.raise_for_status()
+                    content = await response.json()
+                    return content if content else {}
+            except (TimeoutError, asyncio.TimeoutError) as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"Request to {path} timed out (attempt {attempt + 1}/{max_retries}), retrying...")
+                    await asyncio.sleep(1)
+                else:
+                    raise
+
+    async def _get(self, path: str, timeout: int = 30) -> dict:
+        async with self.session.get(f"{self.vllm_server_url}{path}", timeout=timeout) as response:
+            response.raise_for_status()
+            return await response.json()
+
+    async def _get_status_code(self, path: str, timeout: int = 30) -> int:
+        async with self.session.get(f"{self.vllm_server_url}{path}", timeout=timeout) as response:
+            return response.status
