@@ -322,6 +322,7 @@ class AsyncRolloutWorker:
             self._total_groups_scored += 1
 
             for sample in samples:
+                sample.metrics["buffer_qsize"] = self.rollout_buffer.qsize()
                 while True:
                     try:
                         self.rollout_buffer.put_nowait(sample)
@@ -332,10 +333,6 @@ class AsyncRolloutWorker:
                         # Wait for trainer to consume loop
                         logger.debug("Rollout buffer full, waiting for free slot...")
                         await asyncio.sleep(0.1)
-
-            buffer_qsize = self.rollout_buffer.qsize()
-            for sample in samples:
-                sample.metrics["buffer_qsize"] = buffer_qsize
 
             logger.debug(
                 f"Scored group with {len(samples)} samples; rollout_buffer_qsize={self.rollout_buffer.qsize()}"
