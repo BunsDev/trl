@@ -24,7 +24,7 @@ from typing import Any, Protocol
 
 import requests
 import torch
-import torch.distributed as dist
+
 from accelerate.logging import get_logger
 from datasets import Dataset
 from torch.distributed._tensor import DTensor
@@ -364,7 +364,7 @@ class AsyncGRPOTrainer(Trainer):
 
             # Batch all-reduce: [ratio_sum, kl_sum, entropy_sum, clip_sum, count]
             stats = torch.stack([local_ratio_sum, local_kl_sum, local_entropy_sum, local_clip_sum, local_count])
-            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+            stats = self.accelerator.reduce(stats, reduction="sum")
             global_ratio_sum, global_kl_sum, global_entropy_sum, global_clip_sum, global_count = stats.unbind(0)
             self._metrics["train"]["ratio"].append((global_ratio_sum / global_count).item())
             self._metrics["train"]["kl"].append((global_kl_sum / global_count).item())
@@ -375,19 +375,19 @@ class AsyncGRPOTrainer(Trainer):
             # inputs["metrics"] is a dict of 1D tensors keyed by metric name.
             sample_metrics = inputs["metrics"]  # dict[str, Tensor(shape=[B_local])]
             keys = list(sample_metrics.keys())
+            device = completion_mask.device
+            n_samples = torch.tensor(completion_mask.shape[0], dtype=torch.float32, device=device)
             if keys:
-                device = completion_mask.device
-                n_samples = torch.tensor(sample_metrics[keys[0]].shape[0], dtype=torch.float32, device=device)
                 local_sums = torch.stack([sample_metrics[k].to(device).sum() for k in keys])
                 stats = torch.cat([local_sums, n_samples.unsqueeze(0)])
-                dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+                stats = self.accelerator.reduce(stats, reduction="sum")
                 global_sums, global_n_samples = stats[:-1], stats[-1]
                 for k, global_sum in zip(keys, global_sums, strict=True):
                     self._metrics["train"][k].append((global_sum / global_n_samples).item())
 
             completion_length = completion_mask.sum(dim=1).float()
             length_stats = torch.stack([completion_length.sum(), n_samples])
-            dist.all_reduce(length_stats, op=dist.ReduceOp.SUM)
+            length_stats = self.accelerator.reduce(length_stats, reduction="sum")
             self._metrics["train"]["completions/mean_length"].append((length_stats[0] / length_stats[1]).item())
 
             # Training-side tok/s: completion tokens consumed per second
