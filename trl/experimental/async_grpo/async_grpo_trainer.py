@@ -222,18 +222,18 @@ class AsyncGRPOTrainer(Trainer):
                 num_completions_to_print=self.args.num_completions_to_print,
             )
 
-            self._worker_thread = threading.Thread(target=self._run_worker, daemon=True)
-            self._worker_thread.start()
         else:
             self.rollout_queue = None
             self.rollout_worker = None
 
         self.vllm_server_url = self.args.vllm_server_base_url
         self.model_update_group = None
-
-        # Will be set in _run_worker
         self._worker_loop = None
         self._worker_stop_event = None
+
+        if self.accelerator.is_main_process:
+            self._worker_thread = threading.Thread(target=self._run_worker, daemon=True)
+            self._worker_thread.start()
 
         # Add callbacks
         self.add_callback(StepIntervalCallback(self._sync_weight, self.args.weight_sync_steps))
