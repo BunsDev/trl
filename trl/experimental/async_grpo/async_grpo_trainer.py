@@ -15,6 +15,7 @@
 
 import asyncio
 import queue
+import textwrap
 import threading
 import time
 from collections import defaultdict
@@ -25,10 +26,10 @@ from typing import Any, Protocol
 import requests
 import torch
 from accelerate.logging import get_logger
-from datasets import Dataset
+from datasets import Dataset, IterableDataset
 from torch.distributed._tensor import DTensor
-from torch.utils.data import DataLoader, IterableDataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainerCallback
+from torch.utils.data import DataLoader
+from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase, Trainer, TrainerCallback
 from transformers.data.data_collator import DataCollatorMixin
 from vllm.distributed.weight_transfer.nccl_engine import NCCLTrainerSendWeightsArgs, NCCLWeightTransferEngine
 from vllm.utils.network_utils import get_ip, get_open_port
@@ -64,7 +65,7 @@ class StepIntervalCallback(TrainerCallback):
             self.fn()
 
 
-class RolloutQueueDataset(IterableDataset):
+class RolloutQueueDataset(torch.utils.data.IterableDataset):
     def __init__(self, rollout_queue, model_version_fn, max_staleness=3, timeout=120.0):
         self.queue = rollout_queue
         self.model_version_fn = model_version_fn
@@ -93,7 +94,7 @@ class RolloutQueueDataset(IterableDataset):
             }
 
 
-class _EmptyIterableDataset(IterableDataset):
+class _EmptyIterableDataset(torch.utils.data.IterableDataset):
     """Placeholder for non-rank-0 processes. Never actually iterated."""
 
     def __iter__(self):
@@ -147,15 +148,117 @@ class DataCollatorForRollout(DataCollatorMixin):
 
 
 class AsyncGRPOTrainer(Trainer):
+    """
+    Trainer for the Async Group Relative Policy Optimization (AsyncGRPO) method. This algorithm was initially proposed
+    in the paper [DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language
+    Models](https://huggingface.co/papers/2402.03300). Generation is offloaded to an external vLLM server that runs
+    asynchronously alongside training, decoupling rollout from the gradient update loop.
+
+    Example:
+
+    ```python
+    from trl.experimental.async_grpo import AsyncGRPOTrainer
+    from trl.rewards import accuracy_reward
+    from datasets import load_dataset
+
+    dataset = load_dataset("trl-lib/DeepMath-103K", split="train")
+
+    trainer = AsyncGRPOTrainer(
+        model="Qwen/Qwen2.5-0.5B-Instruct",
+        reward_funcs=accuracy_reward,
+        train_dataset=dataset,
+    )
+    trainer.train()
+    ```
+
+    Args:
+        model (`str`):
+            Model to be trained. Must be a string, being the *model id* of a pretrained model hosted inside a model
+            repo on huggingface.co, or a path to a *directory* containing model weights saved using
+            [`~transformers.PreTrainedModel.save_pretrained`], e.g., `'./my_model_directory/'`. The model is loaded
+            using [`~transformers.AutoModelForCausalLM.from_pretrained`]. The model name is also used to identify the
+            model on the vLLM server used for generation.
+        reward_funcs (`RewardFunc | list[RewardFunc]`):
+            Reward functions to be used for computing the rewards. To compute the rewards, we call all the reward
+            functions with the prompts and completions and sum the rewards. Can be either:
+
+            - A single reward function: The function is provided with the prompts and the generated completions, plus
+              any additional columns in the dataset. It should return a list of rewards. Reward functions can be either
+              synchronous or asynchronous and can also return `None` when the reward is not applicable to those
+              samples. This is useful for multi-task training where different reward functions apply to different types
+              of samples. When a reward function returns `None` for a sample, that reward function is excluded from the
+              reward calculation for that sample. For more details, see
+              [Using a custom reward function](#using-a-custom-reward-function).
+            - A list of reward functions, where each item is a reward function as described above. Rewards from all
+              functions are summed.
+        args ([`AsyncGRPOConfig`], *optional*):
+            Configuration for this trainer. If `None`, a default configuration is used.
+        train_dataset ([`~datasets.Dataset`] or [`~datasets.IterableDataset`]):
+            Dataset to use for training. It must include a column `"prompt"`. Any additional columns in the dataset
+            are ignored. The format of the samples can be either:
+
+            - [Standard](dataset_formats#standard): Each sample contains plain text.
+            - [Conversational](dataset_formats#conversational): Each sample contains structured messages (e.g., role
+              and content).
+        processing_class ([`~transformers.PreTrainedTokenizerBase`], *optional*):
+            Processing class used to process the data. The padding side must be set to `"left"`. If `None`, the
+            processing class is loaded from the model's name with [`~transformers.AutoTokenizer.from_pretrained`]. A
+            padding token, `tokenizer.pad_token`, must be set. If the processing class has not set a padding token,
+            `tokenizer.eos_token` will be used as the default.
+        callbacks (list of [`~transformers.TrainerCallback`], *optional*):
+            List of callbacks to customize the training loop. Will add those to the list of default callbacks detailed
+            in [here](https://huggingface.co/docs/transformers/main_classes/callback).
+
+            If you want to remove one of the default callbacks used, use the [`~transformers.Trainer.remove_callback`]
+            method.
+        optimizers (`tuple[torch.optim.Optimizer | None, torch.optim.lr_scheduler.LambdaLR | None]`, *optional*, defaults to `(None, None)`):
+            A tuple containing the optimizer and the scheduler to use. Will default to an instance of `AdamW` on your
+            model and a scheduler given by [`~transformers.get_linear_schedule_with_warmup`] controlled by `args`.
+        tools (list of `Callable`, *optional*):
+            A list of callable tool functions (sync or async) that the model can invoke during generation. Each tool
+            should be a standard Python function with properly type-hinted arguments and return values, and a
+            Google-style docstring describing its purpose, arguments, and return value. For more details, see:
+            https://huggingface.co/docs/transformers/en/chat_extras#passing-tools. The model uses the function's name,
+            type hints, and docstring to determine how to call it. Ensure that the model's chat template supports tool
+            use and that it has been fine-tuned for tool calling.
+        environment_factory (`EnvironmentFactory`, *optional*):
+            A callable that creates and returns an environment instance. The environment class should define methods
+            that can be invoked as tools during generation. Each method should comply with the same requirements as the
+            `tools` described above. If `environment_factory` is provided, an instance of the environment is created
+            for each generation in the batch, allowing for parallel and independent interactions. The environment must
+            also implement a callable `reset` method that can be used to reset state between generations. The `reset`
+            method should return either `None` or a string: when it returns a string, that string is appended to the
+            last user message before generation. This feature is experimental and may change or be removed at any time
+            without prior notice.
+    """
+
+    _tag_names = ["trl", "async-grpo"]
+    _name = "AsyncGRPO"
+    _paper = {
+        "title": "DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models",
+        "id": "2402.03300",
+        # docstyle-ignore
+        "citation": textwrap.dedent("""\
+            @article{shao2024deepseekmath,
+                title        = {{DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models}},
+                author       = {Zhihong Shao and Peiyi Wang and Qihao Zhu and Runxin Xu and Junxiao Song and Mingchuan Zhang and Y. K. Li and Y. Wu and Daya Guo},
+                year         = 2024,
+                eprint       = {arXiv:2402.03300},
+            }
+            """),
+    }
+
     def __init__(
         self,
         model: str,
         reward_funcs: RewardFunc | list[RewardFunc],
-        train_dataset: Dataset,
         args: AsyncGRPOConfig | None = None,
+        train_dataset: Dataset | IterableDataset | None = None,
+        processing_class: PreTrainedTokenizerBase | None = None,
+        callbacks: list[TrainerCallback] | None = None,
+        optimizers: tuple[torch.optim.Optimizer | None, torch.optim.lr_scheduler.LambdaLR | None] = (None, None),
         tools: list[Callable] | None = None,
         environment_factory: EnvironmentFactory | None = None,
-        **kwargs,
     ):
         self.args = args or AsyncGRPOConfig()
 
@@ -168,10 +271,11 @@ class AsyncGRPOTrainer(Trainer):
         model_name = model
         model = AutoModelForCausalLM.from_pretrained(model, device_map=None, dtype=torch.bfloat16)
 
-        # Tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
+        # Processing class
+        if processing_class is None:
+            processing_class = AutoTokenizer.from_pretrained(model_name)
+        if processing_class.pad_token is None:
+            processing_class.pad_token = processing_class.eos_token
 
         # Reward functions
         if not isinstance(reward_funcs, list):
@@ -182,9 +286,10 @@ class AsyncGRPOTrainer(Trainer):
             model=model,
             args=self.args,
             train_dataset=train_dataset,
-            processing_class=tokenizer,
+            processing_class=processing_class,
+            callbacks=callbacks,
+            optimizers=optimizers,
             compute_loss_func="non-None value to disable scaling",
-            **kwargs,
         )
         # Gradient accumulation requires scaled loss. Normally, loss scaling in the parent class depends on whether the
         # model accepts loss-related kwargs. Since we compute our own loss, this check is irrelevant. We set
@@ -199,7 +304,7 @@ class AsyncGRPOTrainer(Trainer):
         self.model_version = 0
         # Create worker thread on rank 0
         if self.accelerator.is_main_process:
-            if not self.train_dataset:
+            if self.train_dataset is None:
                 raise ValueError("train_dataset is required for AsyncGRPOTrainer")
 
             self.rollout_queue = queue.Queue(maxsize=self.args.queue_maxsize)
