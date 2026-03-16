@@ -277,9 +277,7 @@ class AsyncRolloutWorker:
 
                     if pending_completed[group_id] == self.num_generations:
                         await self._groups_to_score.put(group)
-                        logger.debug(
-                            f"Group {group_id} complete; queued_for_scoring={self._groups_to_score.qsize()}"
-                        )
+                        logger.debug(f"Group {group_id} complete; queued_for_scoring={self._groups_to_score.qsize()}")
                         del pending_groups[group_id]
                         del pending_completed[group_id]
         finally:
@@ -528,7 +526,7 @@ class AsyncRolloutWorker:
                     response.raise_for_status()
                     content = await response.json()
                     return content if content else {}
-            except (TimeoutError, asyncio.TimeoutError) as e:
+            except (TimeoutError, asyncio.TimeoutError):
                 if attempt < max_retries - 1:
                     logger.warning(f"Request to {path} timed out (attempt {attempt + 1}/{max_retries}), retrying...")
                     await asyncio.sleep(1)

@@ -42,8 +42,9 @@ from .async_rollout_worker import AsyncRolloutWorker
 
 logger = get_logger(__name__)
 
-# What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
-# rewards.
+# A reward function is a callable that returns a list of floats (the rewards). The callable receives prompts,
+# completions, and additional arguments from the trainer (refer to the trainer's source for details). To ensure forward
+# compatibility, it should accept **kwargs.
 RewardFunc = Callable[..., list[float]]
 
 
@@ -170,8 +171,8 @@ class AsyncGRPOTrainer(Trainer):
 
         # Tokenizer
         tokenizer = AutoTokenizer.from_pretrained(model_name)
-        if tokenizer.pad_token_id is None:
-            tokenizer.pad_token_id = tokenizer.eos_token_id
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
 
         # Reward functions
         if not isinstance(reward_funcs, list):
@@ -183,7 +184,7 @@ class AsyncGRPOTrainer(Trainer):
             args=self.args,
             train_dataset=train_dataset,
             processing_class=tokenizer,
-            compute_loss_func="disable_builtin_scaling",  # disable built-in loss scaling
+            compute_loss_func="non-None value to disable scaling",
             **kwargs,
         )
         # Gradient accumulation requires scaled loss. Normally, loss scaling in the parent class depends on whether the
@@ -191,6 +192,7 @@ class AsyncGRPOTrainer(Trainer):
         # self.model_accepts_loss_kwargs to False to enable scaling.
         self.model_accepts_loss_kwargs = False
 
+        # Initialize the metrics
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
         self._last_compute_loss_time = None
         self._total_train_tokens = 0
@@ -355,7 +357,9 @@ class AsyncGRPOTrainer(Trainer):
 
             clipped = (ratio < 1 - self.epsilon_low) | (ratio > 1 + self.epsilon_high)
             local_clip_sum = (
-                clipped[valid_mask].float().sum() if valid_mask.any() else torch.zeros((), device=completion_mask.device)
+                clipped[valid_mask].float().sum()
+                if valid_mask.any()
+                else torch.zeros((), device=completion_mask.device)
             )
 
             # Batch all-reduce: [ratio_sum, kl_sum, entropy_sum, clip_sum, count]
@@ -373,14 +377,12 @@ class AsyncGRPOTrainer(Trainer):
             keys = list(sample_metrics.keys())
             if keys:
                 device = completion_mask.device
-                n_samples = torch.tensor(
-                    sample_metrics[keys[0]].shape[0], dtype=torch.float32, device=device
-                )
+                n_samples = torch.tensor(sample_metrics[keys[0]].shape[0], dtype=torch.float32, device=device)
                 local_sums = torch.stack([sample_metrics[k].to(device).sum() for k in keys])
                 stats = torch.cat([local_sums, n_samples.unsqueeze(0)])
                 dist.all_reduce(stats, op=dist.ReduceOp.SUM)
                 global_sums, global_n_samples = stats[:-1], stats[-1]
-                for k, global_sum in zip(keys, global_sums):
+                for k, global_sum in zip(keys, global_sums, strict=True):
                     self._metrics["train"][k].append((global_sum / global_n_samples).item())
 
             completion_length = completion_mask.sum(dim=1).float()
@@ -401,7 +403,7 @@ class AsyncGRPOTrainer(Trainer):
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
         mode = "train" if self.model.training else "eval"
-        metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}
+        metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
         if mode == "eval":
             metrics = {f"eval_{key}": val for key, val in metrics.items()}
         logs = {**logs, **metrics}

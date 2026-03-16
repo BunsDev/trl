@@ -1,7 +1,7 @@
 # Async GRPO
 
-> [!WARNING]
-> This trainer is **experimental** and may change or be removed in any release without prior deprecation.
+> [!IMPORTANT]
+> This trainer requires `vllm==0.17.2` and `transformers>=5.2.0`.
 
 ## Overview
 

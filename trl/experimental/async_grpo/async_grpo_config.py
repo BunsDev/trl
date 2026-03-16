@@ -19,12 +19,13 @@ from trl.trainer.base_config import _BaseConfig
 
 @dataclass
 class AsyncGRPOConfig(_BaseConfig):
+    # docstyle-ignore
     r"""
     Configuration class for the [`AsyncGRPOTrainer`].
 
     This class includes only the parameters that are specific to Async GRPO training. For a full list of training
-    arguments, please refer to the [`~transformers.TrainingArguments`] documentation. Note that default values in
-    this class may differ from those in [`~transformers.TrainingArguments`].
+    arguments, please refer to the [`~transformers.TrainingArguments`] documentation. Note that default values in this
+    class may differ from those in [`~transformers.TrainingArguments`].
 
     Parameters:
         > Parameters that control generation
@@ -76,7 +77,7 @@ class AsyncGRPOConfig(_BaseConfig):
 
     > [!NOTE]
     > These parameters have default values different from [`~transformers.TrainingArguments`]:
-    > - `logging_steps`: Defaults to `1` instead of `500`.
+    > - `logging_steps`: Defaults to `10` instead of `500`.
     > - `gradient_checkpointing`: Defaults to `True` instead of `False`.
     > - `bf16`: Defaults to `True` if `fp16` is not set, instead of `False`.
     > - `learning_rate`: Defaults to `1e-6` instead of `5e-5`.
