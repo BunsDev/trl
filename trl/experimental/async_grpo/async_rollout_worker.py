@@ -29,8 +29,9 @@ from datasets import Dataset
 from transformers import AutoTokenizer
 
 from trl.chat_template_utils import add_response_schema, get_training_chat_template, parse_response
-from trl.trainer.utils import print_prompt_completions_sample
 from trl.import_utils import is_vllm_available
+from trl.trainer.utils import print_prompt_completions_sample
+
 
 if is_vllm_available(min_version="0.17.1"):
     from vllm.distributed.weight_transfer.nccl_engine import NCCLTrainerSendWeightsArgs, NCCLWeightTransferEngine
@@ -93,7 +94,7 @@ class AsyncRolloutWorker:
         max_tokens: int = 32,
         temperature: float = 1.0,
         request_timeout: int = 120,
-        server_ready_timeout: float = 300.0,
+        server_timeout: float = 240.0,
         chat_template_kwargs: dict[str, Any] | None = None,
         log_completions: bool = False,
         num_completions_to_print: int = 3,
@@ -153,7 +154,7 @@ class AsyncRolloutWorker:
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.request_timeout = request_timeout
-        self.server_ready_timeout = server_ready_timeout
+        self.server_timeout = server_timeout
         self.chat_template_kwargs = chat_template_kwargs or {}
         self.log_completions = log_completions
         self.num_completions_to_print = num_completions_to_print
@@ -177,7 +178,7 @@ class AsyncRolloutWorker:
 
         async with aiohttp.ClientSession() as session:
             self.session = session
-            await self._wait_for_server_ready(stop_event=stop_event, timeout_s=self.server_ready_timeout)
+            await self._wait_for_server_ready(stop_event=stop_event, timeout_s=self.server_timeout)
             if stop_event.is_set():
                 return
             self._init_weight_transfer()
@@ -269,7 +270,7 @@ class AsyncRolloutWorker:
     async def _wait_for_server_ready(
         self,
         stop_event: asyncio.Event,
-        timeout_s: float = 600.0,
+        timeout_s: float = 240.0,
         poll_interval_s: float = 2.0,
     ) -> None:
         """Block startup until the vLLM server exposes the custom trainer endpoints."""
@@ -282,11 +283,15 @@ class AsyncRolloutWorker:
                 if status_code == 200:
                     logger.info(f"vLLM server ready after {elapsed:.1f}s")
                     return
-            except aiohttp.ClientError:
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
                 pass
 
             if elapsed >= timeout_s:
-                raise TimeoutError(f"Timed out waiting for vLLM server readiness at {self.vllm_server_url}")
+                raise TimeoutError(
+                    f"Timed out after {timeout_s:.0f}s waiting for vLLM server at {self.vllm_server_url}. "
+                    "Make sure the vLLM server is running and reachable. If the server needs more time to load "
+                    "the model, increase `vllm_server_timeout` in your AsyncGRPOConfig."
+                )
             if int(elapsed) % 10 < poll_interval_s:
                 logger.info(f"Still waiting for vLLM server... ({elapsed:.0f}s)")
             await asyncio.sleep(poll_interval_s)

@@ -123,7 +123,7 @@ class AsyncGRPOConfig(_BaseConfig):
         metadata={"help": "Base URL of the vLLM server used for generation (e.g., 'http://localhost:8000')."},
     )
     vllm_server_timeout: float = field(
-        default=300.0,
+        default=240.0,
         metadata={
             "help": "Total timeout duration in seconds to wait for the vLLM server to be ready. If the server is not "
             "up after the timeout, a `TimeoutError` is raised."
