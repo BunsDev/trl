@@ -63,13 +63,20 @@ class RolloutWorkerProtocol(Protocol):
 
 
 class StepIntervalCallback(TrainerCallback):
+    """
+    A callback that calls a function every N optimization steps. When using gradient accumulation, the function is not
+    called more than once per optimization step.
+    """
     def __init__(self, fn, every_n_steps: int):
         self.fn = fn
         self.every_n_steps = every_n_steps
+        self._last_step_called = -1
 
     def on_step_end(self, _args, state, _control, **_kwargs):
-        if state.global_step % self.every_n_steps == 0:
+        print(f"Step {state.global_step} ended (last called: {self._last_step_called}). Checking if we should call the function...")
+        if state.global_step % self.every_n_steps == 0 and state.global_step != self._last_step_called:
             self.fn()
+            self._last_step_called = state.global_step
 
 
 class RolloutQueueDataset(torch.utils.data.IterableDataset):
@@ -518,7 +525,6 @@ class AsyncGRPOTrainer(_BaseTrainer):
 
             self._metrics["train"]["forward_time_s"].append(self._last_forward_time_s)
             # NOTE: in dynamic mbs setup, we would need to agg across DP ranks.
-            self._metrics["train"]["micro_batch_per_gpu"].append(float(input_ids.shape[0]))
             self._metrics["train"]["train_seq_len"].append(float(local_max_len))
         return loss
 
