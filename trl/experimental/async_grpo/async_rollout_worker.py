@@ -392,7 +392,7 @@ class AsyncRolloutWorker:
         generation_tok_per_sec = self._total_completion_tokens / elapsed if elapsed > 0 else 0.0
 
         for sample in samples:
-            sample.metrics["generation_tok/s"] = generation_tok_per_sec
+            sample.metrics["generation_tok_per_s"] = generation_tok_per_sec
             sample.metrics["scoring_time"] = scoring_time
             sample.metrics["wait_scoring"] = wait_scoring
             sample.metrics["buffer_qsize"] = self.rollout_buffer.qsize()
