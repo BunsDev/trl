@@ -217,6 +217,8 @@ class AsyncRolloutWorker:
         )
         t_init.join()
 
+        logger.info("Init weight sync group with vLLM")
+
     def start(self) -> None:
         thread = threading.Thread(target=self._run, daemon=True)
         thread.start()
@@ -370,6 +372,7 @@ class AsyncRolloutWorker:
                     group.tool_mask.append(tool_mask)
                     group.tool_call_counts.append(tool_call_count)
                     group.tool_failure_counts.append(tool_failure_count)
+                    # TODO: move this in generation task, shouldn't matter but is correct
                     self._total_completion_tokens += sum(tool_mask)
                     pending_completed[group_id] += 1
 
@@ -391,16 +394,19 @@ class AsyncRolloutWorker:
         elapsed = time.monotonic() - self._generation_start_time
         generation_tok_per_sec = self._total_completion_tokens / elapsed if elapsed > 0 else 0.0
 
+        scoring_time_ms = scoring_time * 1000
+        wait_scoring_ms = wait_scoring * 1000
+
         for sample in samples:
             sample.metrics["generation_tok_per_s"] = generation_tok_per_sec
-            sample.metrics["scoring_time"] = scoring_time
-            sample.metrics["wait_scoring"] = wait_scoring
+            sample.metrics["scoring_time_ms"] = scoring_time_ms
+            sample.metrics["wait_scoring_ms"] = wait_scoring_ms
             sample.metrics["buffer_qsize"] = self.rollout_buffer.qsize()
 
         logger.info(
             f"[inference] total_completion_tokens={self._total_completion_tokens}, "
-            f"generation_tok/s={generation_tok_per_sec:.1f}, scoring_time={scoring_time:.2f}s, "
-            f"wait_scoring={wait_scoring:.2f}s"
+            f"generation_tok/s={generation_tok_per_sec:.1f}, scoring_time={scoring_time_ms:.1f}ms, "
+            f"wait_scoring={wait_scoring_ms:.1f}ms"
         )
 
     async def _score_loop(self, stop_event: asyncio.Event) -> None:

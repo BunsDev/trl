@@ -81,11 +81,13 @@ class RolloutQueueDataset(torch.utils.data.IterableDataset):
 
     def __iter__(self):
         while True:
+            t0 = time.time()
             try:
                 sample = self.queue.get(timeout=self.timeout)
             except queue.Empty:
                 logger.warning(f"Rollout queue empty for {self.timeout}s, stopping epoch")
                 return  # StopIteration ends epoch
+            queue_wait_time_s = time.time() - t0
 
             staleness = self.model_version_fn() - sample.model_version
             if staleness > self.max_staleness:
@@ -97,7 +99,7 @@ class RolloutQueueDataset(torch.utils.data.IterableDataset):
                 "completion_mask": sample.completion_mask,
                 "old_log_probs": sample.old_log_probs,
                 "advantage": sample.advantage,
-                "metrics": sample.metrics,
+                "metrics": {**sample.metrics, "queue_wait_time_s": queue_wait_time_s},
             }
 
 
@@ -317,8 +319,6 @@ class AsyncGRPOTrainer(_BaseTrainer):
 
         # Initialize the metrics
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
-        self._last_compute_loss_time = None
-        self._total_train_tokens = 0
         self._train_tokens_start_time = None
         self.model_version = 0
         # Create worker and queue on rank 0
@@ -422,7 +422,9 @@ class AsyncGRPOTrainer(_BaseTrainer):
         completion_mask = completion_mask[:, :local_max_len]
         old_log_probs = old_log_probs[:, :local_max_len]
 
+        forward_start = time.time()
         outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+        self._last_forward_time_s = time.time() - forward_start
 
         logits = outputs.logits[:, :-1, :]
         targets = input_ids[:, 1:]
@@ -504,15 +506,18 @@ class AsyncGRPOTrainer(_BaseTrainer):
             length_stats = self.accelerator.reduce(length_stats, reduction="sum")
             self._metrics["train"]["completions/mean_length"].append((length_stats[0] / length_stats[1]).item())
 
-            # Training throughput: completion tokens consumed by the training loop per second.
+            # Training throughput: completion tokens consumed by this training step per second.
             now = time.time()
-            self._total_train_tokens += global_n_tokens.item()
             if self._train_tokens_start_time is not None:
                 train_elapsed = now - self._train_tokens_start_time
-                self._metrics["train"]["training_tok/s"].append(self._total_train_tokens / train_elapsed)
-                self._train_tokens_start_time = now
-            else:
-                self._train_tokens_start_time = now
+                if train_elapsed > 0:
+                    self._metrics["train"]["training_tok/s"].append(global_n_tokens.item() / train_elapsed)
+            self._train_tokens_start_time = now
+
+            self._metrics["train"]["forward_time_s"].append(self._last_forward_time_s)
+            # NOTE: in dynamic mbs setup, we would need to agg across DP ranks.
+            self._metrics["train"]["micro_batch_per_gpu"].append(float(input_ids.shape[0]))
+            self._metrics["train"]["train_seq_len"].append(float(local_max_len))
         return loss
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
@@ -558,7 +563,9 @@ class AsyncGRPOTrainer(_BaseTrainer):
             self.rollout_worker.resume()
             self.model_version += 1
             self.rollout_worker.update_model_version(self.model_version)
-        logger.info(f"Weight sync: done. Total {time.time() - t0:.1f}s")
+        weight_sync_time_s = time.time() - t0
+        self._metrics["train"]["weight_sync_time_s"].append(weight_sync_time_s)
+        logger.info(f"Weight sync: done. Total {weight_sync_time_s:.1f}s")
 
     def _inner_training_loop(self, *args, **kwargs):
         try:
