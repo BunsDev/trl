@@ -29,7 +29,6 @@ from datasets import Dataset
 from transformers import AutoTokenizer
 
 from trl.chat_template_utils import add_response_schema, get_training_chat_template, parse_response
-from trl.import_utils import is_vllm_available
 from trl.trainer.utils import print_prompt_completions_sample
 
 
@@ -180,7 +179,7 @@ class AsyncRolloutWorker:
             await self._wait_for_server_ready(stop_event=stop_event, timeout_s=self.server_ready_timeout)
             if stop_event.is_set():
                 return
-            await asyncio.to_thread(self._init_weight_transfer)
+            self._init_weight_transfer()
             logger.info(
                 f"vllm worker started: num_generations={self.num_generations}, max_inflight_tasks={self.max_inflight_tasks}"
             )
@@ -430,7 +429,6 @@ class AsyncRolloutWorker:
             self._total_groups_scored += 1
 
             for sample in samples:
-                sample.metrics["buffer_qsize"] = self.rollout_buffer.qsize()
                 while True:
                     try:
                         self.rollout_buffer.put_nowait(sample)
@@ -445,12 +443,6 @@ class AsyncRolloutWorker:
             logger.debug(
                 f"Scored group with {len(samples)} samples; rollout_buffer_qsize={self.rollout_buffer.qsize()}"
             )
-            if self._generation_start_time is not None:
-                elapsed = time.monotonic() - self._generation_start_time
-                tok_per_sec = self._total_completion_tokens / elapsed if elapsed > 0 else 0.0
-                logger.info(
-                    f"[inference] total_completion_tokens={self._total_completion_tokens}, generation_tok/s={tok_per_sec:.1f}"
-                )
 
     def _repeat_iterator(self) -> Iterator[tuple[int, dict[str, Any]]]:
         group_id = 0
