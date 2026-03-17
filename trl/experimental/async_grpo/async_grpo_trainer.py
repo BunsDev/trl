@@ -64,19 +64,15 @@ class RolloutWorkerProtocol(Protocol):
 
 class StepIntervalCallback(TrainerCallback):
     """
-    A callback that calls a function every N optimization steps. When using gradient accumulation, the function is not
-    called more than once per optimization step.
+    A callback that calls a function every N optimization steps.
     """
     def __init__(self, fn, every_n_steps: int):
         self.fn = fn
         self.every_n_steps = every_n_steps
-        self._last_step_called = -1
 
     def on_step_end(self, _args, state, _control, **_kwargs):
-        print(f"Step {state.global_step} ended (last called: {self._last_step_called}). Checking if we should call the function...")
-        if state.global_step % self.every_n_steps == 0 and state.global_step != self._last_step_called:
+        if state.global_step % self.every_n_steps == 0:
             self.fn()
-            self._last_step_called = state.global_step
 
 
 class RolloutQueueDataset(torch.utils.data.IterableDataset):
@@ -89,16 +85,21 @@ class RolloutQueueDataset(torch.utils.data.IterableDataset):
     def __iter__(self):
         while True:
             t0 = time.time()
+            qsize = self.queue.qsize()
+            if qsize == 0:
+                logger.info("queue empty, waiting for rollout samples...")
             try:
                 sample = self.queue.get(timeout=self.timeout)
             except queue.Empty:
                 logger.warning(f"Rollout queue empty for {self.timeout}s, stopping epoch")
                 return  # StopIteration ends epoch
             queue_wait_time_s = time.time() - t0
+            if queue_wait_time_s > 1.0:
+                logger.info(f"waited {queue_wait_time_s:.1f}s for sample (qsize={self.queue.qsize()})")
 
             staleness = self.model_version_fn() - sample.model_version
             if staleness > self.max_staleness:
-                logger.debug(f"Dropping stale sample (staleness={staleness}, max={self.max_staleness})")
+                logger.info(f"dropping stale sample (staleness={staleness}, max={self.max_staleness})")
                 continue  # drop stale, pull next
 
             yield {
