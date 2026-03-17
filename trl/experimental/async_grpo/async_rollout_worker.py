@@ -248,7 +248,8 @@ class AsyncRolloutWorker:
 
     def pause(self) -> None:
         t0 = time.time()
-        requests.post(f"{self.vllm_server_url}/pause", params={"mode": "keep"})
+        # requests.post(f"{self.vllm_server_url}/pause", params={"mode": "keep"})
+        requests.post(f"{self.vllm_server_url}/pause", params={"mode": "abort", "clear_cache": True})
         logger.debug(f"[weight_sync] pause HTTP took {time.time() - t0:.1f}s")
 
     def resume(self) -> None:
@@ -367,6 +368,11 @@ class AsyncRolloutWorker:
 
                 done, _ = await asyncio.wait(inflight_tasks, return_when=asyncio.FIRST_COMPLETED, timeout=0.1)
                 if not done:
+                    if not free_slots:
+                        logger.debug(
+                            f"[generate] all {self.max_inflight_tasks} slots busy, "
+                            f"pending_groups={len(pending_groups)}, waiting for completions..."
+                        )
                     continue
 
                 for task in done:
@@ -427,15 +433,24 @@ class AsyncRolloutWorker:
 
     async def _score_loop(self, stop_event: asyncio.Event) -> None:
         while True:
+            t_wait = time.monotonic()
             group = await self._groups_to_score.get()
             if group is None:
                 return
+            score_queue_wait = time.monotonic() - t_wait
 
             wait_scoring = time.monotonic() - group.queued_at
+
+            if score_queue_wait > 0.5:
+                logger.info(f"[score] waited {score_queue_wait:.1f}s for a group to score")
 
             t0 = time.monotonic()
             samples = await self._score_group(group)
             scoring_time = time.monotonic() - t0
+            logger.info(
+                f"[score] scored {len(samples)} samples in {scoring_time:.2f}s, "
+                f"buffer_qsize={self.rollout_buffer.qsize()}"
+            )
 
             self._compute_rollout_metrics(samples, scoring_time, wait_scoring)
 
@@ -459,7 +474,7 @@ class AsyncRolloutWorker:
                         if stop_event.is_set():
                             return
                         # Wait for trainer to consume loop
-                        logger.debug("Rollout buffer full, waiting for free slot...")
+                        logger.info(f"[score] rollout buffer full (maxsize={self.rollout_buffer.maxsize}), waiting for trainer to consume...")
                         await asyncio.sleep(0.1)
 
             logger.debug(
