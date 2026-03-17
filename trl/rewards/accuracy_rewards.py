@@ -23,7 +23,7 @@ if is_math_verify_available():
     from math_verify import LatexExtractionConfig, parse, verify
 
 
-def accuracy_reward(completions: list[list[dict[str, str]]], solution: list[str], **kwargs) -> list[float]:
+def accuracy_reward(completions: list[list[dict[str, str]]], solution: list[str], **kwargs) -> list[float | None]:
     r"""
     Reward function that checks if the completion matches the ground truth.
         - If both gold and prediction are parseable → use math verification.
