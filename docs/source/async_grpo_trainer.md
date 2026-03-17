@@ -52,8 +52,12 @@ The vLLM server and the trainer must run on **separate GPUs**. Use `CUDA_VISIBLE
 ```bash
 # Terminal 1: vLLM server on GPU 0 (dev mode + NCCL weight transfer are required)
 CUDA_VISIBLE_DEVICES=0 VLLM_SERVER_DEV_MODE=1 vllm serve Qwen/Qwen3-4B \
+    --max-model-len 4096 \
     --weight-transfer-config '{"backend":"nccl"}'
 ```
+
+> [!TIP]
+> Set `--max-model-len` to the maximum total sequence length (prompt + completion) you expect. A lower value reduces GPU memory usage on the server, freeing more memory for the KV cache and increasing throughput. A good starting point is the prompt length plus `max_completion_length` from your config.
 
 ```bash
 # Terminal 2: training on GPU 1
