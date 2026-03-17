@@ -534,7 +534,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
     def _sync_weight(self):
         t0 = time.time()
         logger.info("Weight sync: pausing vLLM...")
-        if self.accelerator.is_main_process:
+        if self.accelerator.is_main_process and self.rollout_worker:
             self.rollout_worker.pause()
         t_pause = time.time()
         logger.info(f"Weight sync: pause took {t_pause - t0:.1f}s, waiting for all ranks...")
@@ -543,7 +543,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
         t_barrier = time.time()
 
         logger.info(f"Weight sync: transferring weights... (barrier took {t_barrier - t_pause:.1f}s)")
-        if self.accelerator.is_main_process:
+        if self.accelerator.is_main_process and self.rollout_worker:
             self.rollout_worker.send_weights(self._streaming_iter())
         else:
             # Non-rank-0 processes must still participate in full_tensor() collectives for FSDP2.
@@ -554,7 +554,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
         self.accelerator.wait_for_everyone()
 
         logger.info(f"Weight sync: resuming vLLM... (transfer took {t_transfer - t_barrier:.1f}s)")
-        if self.accelerator.is_main_process:
+        if self.accelerator.is_main_process and self.rollout_worker:
             self.rollout_worker.resume()
             self.model_version += 1
             self.rollout_worker.update_model_version(self.model_version)

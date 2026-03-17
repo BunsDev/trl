@@ -33,10 +33,13 @@ from trl.import_utils import is_vllm_available
 from trl.trainer.utils import print_prompt_completions_sample
 
 
-if is_vllm_available():
+try:
     from vllm.distributed.weight_transfer.nccl_engine import NCCLTrainerSendWeightsArgs, NCCLWeightTransferEngine
     from vllm.utils.network_utils import get_ip, get_open_port
-
+except ImportError as e:
+    raise ImportError(
+        "vLLM is required to use AsyncGRPOTrainer. Please install it with `pip install trl[vllm]`."
+    ) from e
 
 logger = get_logger(__name__)
 
@@ -57,6 +60,7 @@ class RolloutGroup:
     tool_call_counts: list[int]
     tool_failure_counts: list[int]
     model_version: int
+    queued_at: float = 0.0
 
 
 @dataclass(slots=True)
@@ -157,7 +161,7 @@ class AsyncRolloutWorker:
         self.tokenizer = add_response_schema(self.tokenizer)
         self.chat_template = get_training_chat_template(self.tokenizer)
 
-        self._groups_to_score: asyncio.Queue[RolloutGroup] = asyncio.Queue(maxsize=16)
+        self._groups_to_score: asyncio.Queue[RolloutGroup | None] = asyncio.Queue(maxsize=16)
         self._total_completion_tokens = 0
         self._total_groups_scored = 0
         self._generation_start_time: float | None = None
@@ -292,6 +296,7 @@ class AsyncRolloutWorker:
         free_slots = set(range(self.max_inflight_tasks))
         work_iter = self._repeat_iterator()
 
+        self._generation_start_time = time.monotonic()
         try:
             while True:
                 while free_slots and not stop_event.is_set():
@@ -366,9 +371,11 @@ class AsyncRolloutWorker:
                     group.tool_mask.append(tool_mask)
                     group.tool_call_counts.append(tool_call_count)
                     group.tool_failure_counts.append(tool_failure_count)
+                    self._total_completion_tokens += sum(tool_mask)
                     pending_completed[group_id] += 1
 
                     if pending_completed[group_id] == self.num_generations:
+                        group.queued_at = time.monotonic()
                         await self._groups_to_score.put(group)
                         logger.debug(f"Group {group_id} complete; queued_for_scoring={self._groups_to_score.qsize()}")
                         del pending_groups[group_id]
@@ -378,28 +385,38 @@ class AsyncRolloutWorker:
                 task.cancel()
             if inflight_tasks:
                 await asyncio.gather(*inflight_tasks, return_exceptions=True)
+            await self._groups_to_score.put(None)
+
+    def _compute_rollout_metrics(self, samples: list[RolloutSample], scoring_time: float, wait_scoring: float) -> None:
+        assert self._generation_start_time is not None, "generation_start_time init in run()"
+        elapsed = time.monotonic() - self._generation_start_time
+        generation_tok_per_sec = self._total_completion_tokens / elapsed if elapsed > 0 else 0.0
+
+        for sample in samples:
+            sample.metrics["generation_tok/s"] = generation_tok_per_sec
+            sample.metrics["scoring_time"] = scoring_time
+            sample.metrics["wait_scoring"] = wait_scoring
+            sample.metrics["buffer_qsize"] = self.rollout_buffer.qsize()
+
+        logger.info(
+            f"[inference] total_completion_tokens={self._total_completion_tokens}, "
+            f"generation_tok/s={generation_tok_per_sec:.1f}, scoring_time={scoring_time:.2f}s, "
+            f"wait_scoring={wait_scoring:.2f}s"
+        )
 
     async def _score_loop(self, stop_event: asyncio.Event) -> None:
         while True:
-            if stop_event.is_set() and self._groups_to_score.empty():
+            group = await self._groups_to_score.get()
+            if group is None:
                 return
 
-            try:
-                group = await asyncio.wait_for(self._groups_to_score.get(), timeout=0.1)
-            except TimeoutError:
-                continue
+            wait_scoring = time.monotonic() - group.queued_at
 
+            t0 = time.monotonic()
             samples = await self._score_group(group)
+            scoring_time = time.monotonic() - t0
 
-            # Compute generation throughput. Skip the first group (elapsed ≈ 0 would cause a spike).
-            group_tokens = sum(sum(sample.completion_mask) for sample in samples)
-            self._total_completion_tokens += group_tokens
-            if self._generation_start_time is not None:
-                elapsed = time.monotonic() - self._generation_start_time
-                tok_per_sec = self._total_completion_tokens / elapsed if elapsed > 0 else 0.0
-                for sample in samples:
-                    sample.metrics["generation_tok/s"] = tok_per_sec
-            self._generation_start_time = self._generation_start_time or time.monotonic()
+            self._compute_rollout_metrics(samples, scoring_time, wait_scoring)
 
             if self.log_completions and samples:
                 print_prompt_completions_sample(
@@ -549,7 +566,7 @@ class AsyncRolloutWorker:
         completion_logprobs = choice["logprobs"]["token_logprobs"]
         return completion_ids, completion_logprobs
 
-    async def _score_group(self, group: RolloutGroup) -> list[RolloutSample] | None:
+    async def _score_group(self, group: RolloutGroup) -> list[RolloutSample]:
         kwargs = dict(
             completions=group.completions,
             prompt=group.prompt,
