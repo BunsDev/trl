@@ -504,15 +504,15 @@ class AsyncGRPOTrainer(_BaseTrainer):
             length_stats = self.accelerator.reduce(length_stats, reduction="sum")
             self._metrics["train"]["completions/mean_length"].append((length_stats[0] / length_stats[1]).item())
 
-            # Training-side tok/s: completion tokens consumed per second
+            # Training throughput: completion tokens consumed by the training loop per second.
             now = time.time()
-            if self._train_tokens_start_time is None:
-                self._train_tokens_start_time = now
             self._total_train_tokens += global_n_tokens.item()
-            train_elapsed = now - self._train_tokens_start_time
-            if train_elapsed > 0:
-                self._metrics["train"]["train_tok/s"].append(self._total_train_tokens / train_elapsed)
-
+            if self._train_tokens_start_time is not None:
+                train_elapsed = now - self._train_tokens_start_time
+                self._metrics["train"]["training_tok/s"].append(self._total_train_tokens / train_elapsed)
+                self._train_tokens_start_time = now
+            else:
+                self._train_tokens_start_time = now
         return loss
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:

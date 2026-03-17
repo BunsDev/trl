@@ -399,7 +399,7 @@ class AsyncRolloutWorker:
             elapsed = time.monotonic() - self._generation_start_time
             tok_per_sec = self._total_completion_tokens / elapsed if elapsed > 0 else 0.0
             for sample in samples:
-                sample.metrics["tok/s"] = tok_per_sec
+                sample.metrics["generation_tok/s"] = tok_per_sec
 
             if self.log_completions and samples:
                 print_prompt_completions_sample(
