@@ -289,14 +289,6 @@ class AsyncGRPOTrainer(_BaseTrainer):
         if not isinstance(reward_funcs, list):
             reward_funcs = [reward_funcs]
 
-        # Infer max_steps from dataset size when not explicitly set
-        if self.args.max_steps <= 0 and train_dataset is not None and hasattr(train_dataset, "__len__"):
-            samples_per_epoch = len(train_dataset) * self.args.num_generations
-            steps_per_epoch = samples_per_epoch / (
-                self.args.per_device_train_batch_size * self.args.gradient_accumulation_steps
-            )
-            self.args.max_steps = int(self.args.num_train_epochs * steps_per_epoch)
-
         # Initialize the Trainer
         super().__init__(
             model=model,
@@ -311,6 +303,17 @@ class AsyncGRPOTrainer(_BaseTrainer):
         # model accepts loss-related kwargs. Since we compute our own loss, this check is irrelevant. We set
         # self.model_accepts_loss_kwargs to False to enable scaling.
         self.model_accepts_loss_kwargs = False
+
+        # Infer max_steps from dataset size when not explicitly set. This must happen after super().__init__()
+        # so that self.accelerator.num_processes is available for the correct calculation.
+        if self.args.max_steps <= 0 and train_dataset is not None and hasattr(train_dataset, "__len__"):
+            samples_per_epoch = len(train_dataset) * self.args.num_generations
+            samples_per_step = (
+                self.args.per_device_train_batch_size
+                * self.args.gradient_accumulation_steps
+                * self.accelerator.num_processes
+            )
+            self.args.max_steps = int(self.args.num_train_epochs * samples_per_epoch / samples_per_step)
 
         # Initialize the metrics
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
@@ -443,7 +446,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
         loss = loss / tokens_per_rank.to(torch.float32)
         # For DAPO, we would scale like this instead:
         # loss = loss / max(per_token_loss.size(0), 1)
-        loss = loss / self.args.gradient_accumulation_steps
+        loss = loss / self.current_gradient_accumulation_steps
 
         with torch.no_grad():
             valid_mask = completion_mask > 0
