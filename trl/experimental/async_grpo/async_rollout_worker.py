@@ -247,7 +247,7 @@ class AsyncRolloutWorker:
             loop.close()
 
     def pause(self) -> None:
-        requests.post(f"{self.vllm_server_url}/pause", params={"mode": "wait"})
+        requests.post(f"{self.vllm_server_url}/pause", params={"mode": "abort", "clear_cache": True})
 
     def resume(self) -> None:
         requests.post(f"{self.vllm_server_url}/resume")
