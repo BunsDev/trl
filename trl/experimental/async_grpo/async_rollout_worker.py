@@ -88,7 +88,7 @@ class AsyncRolloutWorker:
         tools: list[Callable] | None = None,
         environment_factory: Callable[[], object] | None = None,
         num_generations: int = 8,
-        max_inflight_tasks: int = 8,
+        max_inflight_tasks: int = 128,
         queue_maxsize: int = 0,
         vllm_server_url: str = "http://localhost:8000",
         max_tokens: int = 32,
@@ -247,25 +247,35 @@ class AsyncRolloutWorker:
             loop.close()
 
     def pause(self) -> None:
-        requests.post(f"{self.vllm_server_url}/pause", params={"mode": "abort", "clear_cache": True})
+        t0 = time.time()
+        requests.post(f"{self.vllm_server_url}/pause", params={"mode": "keep"})
+        logger.debug(f"[weight_sync] pause HTTP took {time.time() - t0:.1f}s")
 
     def resume(self) -> None:
+        t0 = time.time()
         requests.post(f"{self.vllm_server_url}/resume")
+        logger.debug(f"[weight_sync] resume HTTP took {time.time() - t0:.1f}s")
 
     def send_weights(self, iterator) -> None:
         if self.model_update_group is None:
             return
+        t0 = time.time()
         t_update = threading.Thread(
             target=requests.post,
             args=(f"{self.vllm_server_url}/update_weights",),
             kwargs={"json": {"update_info": self._weight_update_info}, "timeout": 1800},
         )
         t_update.start()
+        logger.debug(f"[weight_sync] /update_weights POST sent ({time.time() - t0:.1f}s)")
+        t_nccl = time.time()
         NCCLWeightTransferEngine.trainer_send_weights(
             iterator=iterator,
             trainer_args=NCCLTrainerSendWeightsArgs(group=self.model_update_group, packed=True),
         )
+        logger.debug(f"[weight_sync] NCCL transfer took {time.time() - t_nccl:.1f}s")
+        t_join = time.time()
         t_update.join()
+        logger.debug(f"[weight_sync] /update_weights join took {time.time() - t_join:.1f}s (total send_weights: {time.time() - t0:.1f}s)")
 
     async def _wait_for_server_ready(
         self,
@@ -664,12 +674,6 @@ class AsyncRolloutWorker:
                     await asyncio.sleep(1)
                 else:
                     raise
-
-    async def _get(self, path: str, timeout: float = 30) -> dict:
-        client_timeout = aiohttp.ClientTimeout(total=timeout)
-        async with self.session.get(f"{self.vllm_server_url}{path}", timeout=client_timeout) as response:
-            response.raise_for_status()
-            return await response.json()
 
     async def _get_status_code(self, path: str, timeout: float = 30) -> int:
         client_timeout = aiohttp.ClientTimeout(total=timeout)

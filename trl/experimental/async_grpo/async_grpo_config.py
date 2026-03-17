@@ -57,10 +57,10 @@ class AsyncGRPOConfig(_BaseConfig):
 
         > Parameters that control the async rollout pipeline
 
-        max_inflight_tasks (`int`, *optional*, defaults to `64`):
+        max_inflight_tasks (`int`, *optional*, defaults to `128`):
             Maximum number of concurrent generation tasks. If no environment is used, set this to the vLLM
             `max-num-seqs`; otherwise, set it depending on how many parallel environments you can run.
-        max_staleness (`int`, *optional*, defaults to `3`):
+        max_staleness (`int`, *optional*, defaults to `4`):
             Maximum number of weight update steps a rollout sample can lag behind the current model version before
             being discarded.
         queue_maxsize (`int`, *optional*, defaults to `1024`):
@@ -146,14 +146,14 @@ class AsyncGRPOConfig(_BaseConfig):
 
     # Parameters that control the async rollout pipeline
     max_inflight_tasks: int = field(
-        default=64,
+        default=128,
         metadata={
             "help": "Maximum number of concurrent generation tasks. If no environment is used, set this to the vLLM "
             "`max-num-seqs`; otherwise, set it depending on how many parallel environments you can run."
         },
     )
     max_staleness: int = field(
-        default=3,
+        default=4,
         metadata={
             "help": "Maximum number of weight update steps a rollout sample can lag behind the current model version "
             "before being discarded."
