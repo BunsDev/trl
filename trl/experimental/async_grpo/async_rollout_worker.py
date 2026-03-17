@@ -27,8 +27,11 @@ import requests
 from accelerate.logging import get_logger
 from datasets import Dataset
 from transformers import AutoTokenizer
-from vllm.distributed.weight_transfer.nccl_engine import NCCLTrainerSendWeightsArgs, NCCLWeightTransferEngine
-from vllm.utils.network_utils import get_ip, get_open_port
+from trl.import_utils import is_vllm_available
+
+if is_vllm_available():
+    from vllm.distributed.weight_transfer.nccl_engine import NCCLTrainerSendWeightsArgs, NCCLWeightTransferEngine
+    from vllm.utils.network_utils import get_ip, get_open_port
 
 from trl.chat_template_utils import (
     add_response_schema,
@@ -391,15 +394,15 @@ class AsyncRolloutWorker:
 
             samples = await self._score_group(group)
 
-            # Compute tok/s before pushing so the metric is included in each sample.
+            # Compute generation throughput. Skip the first group (elapsed ≈ 0 would cause a spike).
             group_tokens = sum(sum(sample.completion_mask) for sample in samples)
             self._total_completion_tokens += group_tokens
-            if self._generation_start_time is None:
-                self._generation_start_time = time.monotonic()
-            elapsed = time.monotonic() - self._generation_start_time
-            tok_per_sec = self._total_completion_tokens / elapsed if elapsed > 0 else 0.0
-            for sample in samples:
-                sample.metrics["generation_tok/s"] = tok_per_sec
+            if self._generation_start_time is not None:
+                elapsed = time.monotonic() - self._generation_start_time
+                tok_per_sec = self._total_completion_tokens / elapsed if elapsed > 0 else 0.0
+                for sample in samples:
+                    sample.metrics["generation_tok/s"] = tok_per_sec
+            self._generation_start_time = self._generation_start_time or time.monotonic()
 
             if self.log_completions and samples:
                 print_prompt_completions_sample(
@@ -428,9 +431,12 @@ class AsyncRolloutWorker:
             logger.debug(
                 f"Scored group with {len(samples)} samples; rollout_buffer_qsize={self.rollout_buffer.qsize()}"
             )
-            logger.info(
-                f"[inference] total_completion_tokens={self._total_completion_tokens}, tok/s={tok_per_sec:.1f}"
-            )
+            if self._generation_start_time is not None:
+                elapsed = time.monotonic() - self._generation_start_time
+                tok_per_sec = self._total_completion_tokens / elapsed if elapsed > 0 else 0.0
+                logger.info(
+                    f"[inference] total_completion_tokens={self._total_completion_tokens}, generation_tok/s={tok_per_sec:.1f}"
+                )
 
     def _repeat_iterator(self) -> Iterator[tuple[int, dict[str, Any]]]:
         group_id = 0
@@ -624,11 +630,12 @@ class AsyncRolloutWorker:
             )
         ]
 
-    async def _post(self, path: str, payload: dict, timeout: int, max_retries: int = 3) -> dict:
+    async def _post(self, path: str, payload: dict, timeout: float, max_retries: int = 3) -> dict:
+        client_timeout = aiohttp.ClientTimeout(total=timeout)
         for attempt in range(max_retries):
             try:
                 async with self.session.post(
-                    f"{self.vllm_server_url}{path}", json=payload, timeout=timeout
+                    f"{self.vllm_server_url}{path}", json=payload, timeout=client_timeout
                 ) as response:
                     response.raise_for_status()
                     content = await response.json()
@@ -640,11 +647,13 @@ class AsyncRolloutWorker:
                 else:
                     raise
 
-    async def _get(self, path: str, timeout: int = 30) -> dict:
-        async with self.session.get(f"{self.vllm_server_url}{path}", timeout=timeout) as response:
+    async def _get(self, path: str, timeout: float = 30) -> dict:
+        client_timeout = aiohttp.ClientTimeout(total=timeout)
+        async with self.session.get(f"{self.vllm_server_url}{path}", timeout=client_timeout) as response:
             response.raise_for_status()
             return await response.json()
 
-    async def _get_status_code(self, path: str, timeout: int = 30) -> int:
-        async with self.session.get(f"{self.vllm_server_url}{path}", timeout=timeout) as response:
+    async def _get_status_code(self, path: str, timeout: float = 30) -> int:
+        client_timeout = aiohttp.ClientTimeout(total=timeout)
+        async with self.session.get(f"{self.vllm_server_url}{path}", timeout=client_timeout) as response:
             return response.status
