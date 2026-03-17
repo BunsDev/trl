@@ -15,6 +15,7 @@
 import asyncio
 import inspect
 import queue
+import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -22,9 +23,12 @@ from typing import Any, TypeAlias
 
 import aiohttp
 import numpy as np
+import requests
 from accelerate.logging import get_logger
 from datasets import Dataset
 from transformers import AutoTokenizer
+from vllm.distributed.weight_transfer.nccl_engine import NCCLTrainerSendWeightsArgs, NCCLWeightTransferEngine
+from vllm.utils.network_utils import get_ip, get_open_port
 
 from trl.chat_template_utils import (
     add_response_schema,
@@ -79,12 +83,12 @@ class AsyncRolloutWorker:
         self,
         model_name: str,
         dataset: Dataset,
-        rollout_buffer: queue.Queue[RolloutSample],
         reward_funcs: list[Callable[..., list[float]]],
         tools: list[Callable] | None = None,
         environment_factory: Callable[[], object] | None = None,
         num_generations: int = 8,
         max_inflight_tasks: int = 8,
+        queue_maxsize: int = 0,
         vllm_server_url: str = "http://localhost:8000",
         max_tokens: int = 32,
         temperature: float = 1.0,
@@ -93,11 +97,24 @@ class AsyncRolloutWorker:
         chat_template_kwargs: dict[str, Any] | None = None,
         log_completions: bool = False,
         num_completions_to_print: int = 3,
+        weight_names: list[str] | None = None,
+        weight_dtype_names: list[str] | None = None,
+        weight_shapes: list[list[int]] | None = None,
     ):
         self.model_name = model_name
         self.dataset = dataset
         self._dataset_iter = iter(dataset)
-        self.rollout_buffer = rollout_buffer
+        self.rollout_buffer: queue.Queue[RolloutSample] = queue.Queue(maxsize=queue_maxsize)
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._stop_event: asyncio.Event | None = None
+        self._weight_update_info = {
+            "names": weight_names,
+            "dtype_names": weight_dtype_names,
+            "shapes": weight_shapes,
+            "packed": True,
+            "is_checkpoint_format": True,
+        }
+
         self.reward_funcs = reward_funcs
         self.reward_func_names = [f.__name__ for f in reward_funcs]
         self.num_generations = num_generations
@@ -128,6 +145,7 @@ class AsyncRolloutWorker:
         self.tools = base_tools + (environment_methods[0] if self.environments is not None else [])
 
         self.vllm_server_url = vllm_server_url.rstrip("/")
+        self.model_update_group = None
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.request_timeout = request_timeout
@@ -158,6 +176,7 @@ class AsyncRolloutWorker:
             await self._wait_for_server_ready(stop_event=stop_event, timeout_s=self.server_ready_timeout)
             if stop_event.is_set():
                 return
+            await asyncio.to_thread(self._init_weight_transfer)
             logger.info(
                 f"vllm worker started: num_generations={self.num_generations}, max_inflight_tasks={self.max_inflight_tasks}"
             )
@@ -166,6 +185,80 @@ class AsyncRolloutWorker:
                 asyncio.create_task(self._generate_loop(stop_event=stop_event)),
                 asyncio.create_task(self._score_loop(stop_event=stop_event)),
             )
+
+    def _init_weight_transfer(self) -> None:
+        response = requests.get(f"{self.vllm_server_url}/get_world_size")
+        inference_world_size = response.json()["world_size"]
+        world_size = inference_world_size + 1
+        master_address = get_ip()
+        master_port = get_open_port()
+
+        init_info = {
+            "master_address": master_address,
+            "master_port": master_port,
+            "rank_offset": 1,
+            "world_size": world_size,
+        }
+        t_init = threading.Thread(
+            target=requests.post,
+            args=(f"{self.vllm_server_url}/init_weight_transfer_engine",),
+            kwargs={"json": {"init_info": init_info}, "timeout": 120},
+        )
+        t_init.start()
+        self.model_update_group = NCCLWeightTransferEngine.trainer_init(
+            {
+                "master_address": master_address,
+                "master_port": master_port,
+                "world_size": world_size,
+            }
+        )
+        t_init.join()
+
+    def start(self) -> None:
+        thread = threading.Thread(target=self._run, daemon=True)
+        thread.start()
+
+    def stop(self) -> None:
+        logger.info("Stopping worker thread...")
+        if self._loop and self._loop.is_running():
+            try:
+                self._loop.call_soon_threadsafe(self._stop_event.set)
+            except RuntimeError:
+                pass
+
+    def _run(self) -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._loop = loop
+        self._stop_event = asyncio.Event()
+        try:
+            loop.run_until_complete(self.run(stop_event=self._stop_event))
+        except Exception as e:
+            logger.exception(f"Worker thread failed: {e}")
+            raise
+        finally:
+            loop.close()
+
+    def pause(self) -> None:
+        requests.post(f"{self.vllm_server_url}/pause", params={"mode": "wait"})
+
+    def resume(self) -> None:
+        requests.post(f"{self.vllm_server_url}/resume")
+
+    def send_weights(self, iterator) -> None:
+        if self.model_update_group is None:
+            return
+        t_update = threading.Thread(
+            target=requests.post,
+            args=(f"{self.vllm_server_url}/update_weights",),
+            kwargs={"json": {"update_info": self._weight_update_info}, "timeout": 1800},
+        )
+        t_update.start()
+        NCCLWeightTransferEngine.trainer_send_weights(
+            iterator=iterator,
+            trainer_args=NCCLTrainerSendWeightsArgs(group=self.model_update_group, packed=True),
+        )
+        t_update.join()
 
     async def _wait_for_server_ready(
         self,
@@ -240,10 +333,7 @@ class AsyncRolloutWorker:
 
                     logger.info(f"[slot] assigned slot={slot} group={group_id} free_after={len(free_slots)}")
                     task = asyncio.create_task(
-                        self._generate_one(
-                            pending_groups[group_id].prompt,
-                            tool_dict=self._sync_tool_dicts[slot],
-                        )
+                        self._generate_one(pending_groups[group_id].prompt, tool_dict=self._sync_tool_dicts[slot])
                     )
                     inflight_tasks[task] = (group_id, slot)
 

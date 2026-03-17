@@ -13,17 +13,14 @@
 # limitations under the License.
 
 
-import asyncio
 import queue
 import textwrap
-import threading
 import time
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-import requests
 import torch
 from accelerate.logging import get_logger
 from datasets import Dataset, IterableDataset
@@ -31,8 +28,6 @@ from torch.distributed._tensor import DTensor
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase, Trainer, TrainerCallback
 from transformers.data.data_collator import DataCollatorMixin
-from vllm.distributed.weight_transfer.nccl_engine import NCCLTrainerSendWeightsArgs, NCCLWeightTransferEngine
-from vllm.utils.network_utils import get_ip, get_open_port
 
 from trl.trainer.utils import pad, selective_log_softmax
 
@@ -53,6 +48,17 @@ class _SupportsReset(Protocol):
 
 
 EnvironmentFactory = Callable[[], _SupportsReset]
+
+
+class RolloutWorkerProtocol(Protocol):
+    rollout_buffer: queue.Queue
+
+    def start(self) -> None: ...
+    def stop(self) -> None: ...
+    def pause(self) -> None: ...
+    def resume(self) -> None: ...
+    def send_weights(self, iterator: Iterator[tuple[str, torch.Tensor]]) -> None: ...
+    def update_model_version(self, version: int) -> None: ...
 
 
 class StepIntervalCallback(TrainerCallback):
@@ -187,15 +193,15 @@ class AsyncGRPOTrainer(Trainer):
               synchronous or asynchronous and can also return `None` when the reward is not applicable to those
               samples. This is useful for multi-task training where different reward functions apply to different types
               of samples. When a reward function returns `None` for a sample, that reward function is excluded from the
-              reward calculation for that sample. For more details, see
-              [Using a custom reward function](#using-a-custom-reward-function).
+              reward calculation for that sample. For more details, see [Using a custom reward
+              function](#using-a-custom-reward-function).
             - A list of reward functions, where each item is a reward function as described above. Rewards from all
               functions are summed.
         args ([`AsyncGRPOConfig`], *optional*):
             Configuration for this trainer. If `None`, a default configuration is used.
         train_dataset ([`~datasets.Dataset`] or [`~datasets.IterableDataset`]):
-            Dataset to use for training. It must include a column `"prompt"`. Any additional columns in the dataset
-            are ignored. The format of the samples can be either:
+            Dataset to use for training. It must include a column `"prompt"`. Any additional columns in the dataset are
+            ignored. The format of the samples can be either:
 
             - [Standard](dataset_formats#standard): Each sample contains plain text.
             - [Conversational](dataset_formats#conversational): Each sample contains structured messages (e.g., role
@@ -259,6 +265,7 @@ class AsyncGRPOTrainer(Trainer):
         optimizers: tuple[torch.optim.Optimizer | None, torch.optim.lr_scheduler.LambdaLR | None] = (None, None),
         tools: list[Callable] | None = None,
         environment_factory: EnvironmentFactory | None = None,
+        rollout_worker: RolloutWorkerProtocol | None = None,
     ):
         self.args = args or AsyncGRPOConfig()
 
@@ -302,60 +309,51 @@ class AsyncGRPOTrainer(Trainer):
         self._total_train_tokens = 0
         self._train_tokens_start_time = None
         self.model_version = 0
-        # Create worker thread on rank 0
+        # Create worker and queue on rank 0
         if self.accelerator.is_main_process:
             if self.train_dataset is None:
                 raise ValueError("train_dataset is required for AsyncGRPOTrainer")
 
-            self.rollout_queue = queue.Queue(maxsize=self.args.queue_maxsize)
-            self.rollout_worker = AsyncRolloutWorker(
-                model_name=model_name,
-                dataset=train_dataset,
-                rollout_buffer=self.rollout_queue,
-                reward_funcs=reward_funcs,
-                tools=tools,
-                environment_factory=environment_factory,
-                num_generations=self.args.num_generations,
-                max_inflight_tasks=self.args.max_inflight_tasks,
-                vllm_server_url=self.args.vllm_server_base_url,
-                max_tokens=self.args.max_completion_length,
-                temperature=self.args.temperature,
-                request_timeout=self.args.request_timeout,
-                server_ready_timeout=self.args.vllm_server_timeout,
-                chat_template_kwargs=self.args.chat_template_kwargs,
-                log_completions=self.args.log_completions,
-                num_completions_to_print=self.args.num_completions_to_print,
-            )
-
+            if rollout_worker is not None:
+                # Use the injected worker (e.g. a stub in tests). The queue is owned by the worker.
+                self.rollout_worker = rollout_worker
+            else:
+                # Collect weight metadata once — names/dtypes/shapes are fixed for the lifetime of training.
+                # DTensor.shape returns the global shape without triggering any all-gather.
+                weight_names, weight_dtype_names, weight_shapes = [], [], []
+                for name, param in model.named_parameters():
+                    weight_names.append(name)
+                    weight_dtype_names.append(str(param.dtype).split(".")[-1])
+                    weight_shapes.append(list(param.shape))
+                self.rollout_worker = AsyncRolloutWorker(
+                    model_name=model_name,
+                    dataset=train_dataset,
+                    reward_funcs=reward_funcs,
+                    tools=tools,
+                    environment_factory=environment_factory,
+                    num_generations=self.args.num_generations,
+                    max_inflight_tasks=self.args.max_inflight_tasks,
+                    queue_maxsize=self.args.queue_maxsize,
+                    vllm_server_url=self.args.vllm_server_base_url,
+                    max_tokens=self.args.max_completion_length,
+                    temperature=self.args.temperature,
+                    request_timeout=self.args.request_timeout,
+                    server_ready_timeout=self.args.vllm_server_timeout,
+                    chat_template_kwargs=self.args.chat_template_kwargs,
+                    log_completions=self.args.log_completions,
+                    num_completions_to_print=self.args.num_completions_to_print,
+                    weight_names=weight_names,
+                    weight_dtype_names=weight_dtype_names,
+                    weight_shapes=weight_shapes,
+                )
+            self.rollout_worker.start()
+            self.rollout_queue = self.rollout_worker.rollout_buffer
         else:
             self.rollout_queue = None
             self.rollout_worker = None
 
-        self.vllm_server_url = self.args.vllm_server_base_url
-        self.model_update_group = None
-        self._worker_loop = None
-        self._worker_stop_event = None
-
-        if self.accelerator.is_main_process:
-            self._worker_thread = threading.Thread(target=self._run_worker, daemon=True)
-            self._worker_thread.start()
-
         # Add callbacks
         self.add_callback(StepIntervalCallback(self._sync_weight, self.args.weight_sync_steps))
-
-    def _run_worker(self):
-        """Runs the AsyncRolloutWorker inside an asyncio event loop in a background thread."""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        self._worker_loop = loop
-        self._worker_stop_event = asyncio.Event()
-        try:
-            loop.run_until_complete(self.rollout_worker.run(stop_event=self._worker_stop_event))
-        except Exception as e:
-            logger.exception(f"Worker thread failed: {e}")
-            raise
-        finally:
-            loop.close()
 
     def get_train_dataloader(self) -> DataLoader:
         if self.accelerator.is_main_process:
@@ -403,10 +401,9 @@ class AsyncGRPOTrainer(Trainer):
         old_log_probs = inputs["old_log_probs"]
         advantages = inputs["advantages"]
 
-        # The collator pads to the global batch max length (across all ranks). After
-        # DataLoaderDispatcher slices and sends rows to each rank, the local slice is
-        # still padded to that global max. Truncate to the longest real sequence in
-        # this rank's slice so we don't run the forward pass over pure-padding columns.
+        # The collator pads to the global batch max length (across all ranks). After DataLoaderDispatcher slices and
+        # sends rows to each rank, the local slice is still padded to that global max. Truncate to the longest real
+        # sequence in this rank's slice so we don't run the forward pass over pure-padding columns.
         local_max_len = attention_mask.sum(dim=1).max()
         input_ids = input_ids[:, :local_max_len]
         attention_mask = attention_mask[:, :local_max_len]
@@ -515,41 +512,18 @@ class AsyncGRPOTrainer(Trainer):
         super().log(logs, start_time)
         self._metrics[mode].clear()
 
-    def _init_weight_transfer(self) -> None:
-        if not self.accelerator.is_main_process:
-            return
-        response = requests.get(f"{self.vllm_server_url}/get_world_size")
-        inference_world_size = response.json()["world_size"]
-        world_size = inference_world_size + 1
-        master_address = get_ip()
-        master_port = get_open_port()
-
-        init_info = {
-            "master_address": master_address,
-            "master_port": master_port,
-            "rank_offset": 1,
-            "world_size": world_size,
-        }
-        t_init = threading.Thread(
-            target=requests.post,
-            args=(f"{self.vllm_server_url}/init_weight_transfer_engine",),
-            kwargs={"json": {"init_info": init_info}, "timeout": 120},
-        )
-        t_init.start()
-        self.model_update_group = NCCLWeightTransferEngine.trainer_init(
-            {
-                "master_address": master_address,
-                "master_port": master_port,
-                "world_size": world_size,
-            }
-        )
-        t_init.join()
+    def _streaming_iter(self):
+        # Iterate parameters one at a time. For FSDP2 (DTensor), full_tensor() all-gathers just this parameter across
+        # FSDP ranks, then frees it once the generator advances — avoiding materializing the full model in memory.
+        for name, param in self.model.named_parameters():
+            full = param.full_tensor() if isinstance(param, DTensor) else param.detach()
+            yield name, full
 
     def _sync_weight(self):
         t0 = time.time()
         logger.info("Weight sync: pausing vLLM...")
         if self.accelerator.is_main_process:
-            requests.post(f"{self.vllm_server_url}/pause", params={"mode": "wait"})
+            self.rollout_worker.pause()
         t_pause = time.time()
         logger.info(f"Weight sync: pause took {t_pause - t0:.1f}s, waiting for all ranks...")
 
@@ -557,48 +531,11 @@ class AsyncGRPOTrainer(Trainer):
         t_barrier = time.time()
 
         logger.info(f"Weight sync: transferring weights... (barrier took {t_barrier - t_pause:.1f}s)")
-        if self.accelerator.is_main_process and self.model_update_group:
-            # Build metadata without materializing tensors.
-            # DTensor.shape returns the global shape; no all-gather needed here.
-            names, dtype_names, shapes = [], [], []
-            for name, param in self.model.named_parameters():
-                names.append(name)
-                dtype_names.append(str(param.dtype).split(".")[-1])
-                shapes.append(list(param.shape))
-
-            update_payload = {
-                "update_info": {
-                    "names": names,
-                    "dtype_names": dtype_names,
-                    "shapes": shapes,
-                    "packed": True,
-                    "is_checkpoint_format": True,
-                }
-            }
-            t_update = threading.Thread(
-                target=requests.post,
-                args=(f"{self.vllm_server_url}/update_weights",),
-                kwargs={"json": update_payload, "timeout": 1800},
-            )
-            t_update.start()
-
-        def _streaming_iter():
-            # Iterate parameters one at a time. For FSDP2 (DTensor), full_tensor()
-            # all-gathers just this parameter across FSDP ranks, then frees it once
-            # the generator advances — avoiding materializing the full model in memory.
-            for name, param in self.model.named_parameters():
-                full = param.full_tensor() if isinstance(param, DTensor) else param.detach()
-                yield name, full
-
-        if self.accelerator.is_main_process and self.model_update_group:
-            NCCLWeightTransferEngine.trainer_send_weights(
-                iterator=_streaming_iter(),
-                trainer_args=NCCLTrainerSendWeightsArgs(group=self.model_update_group, packed=True),
-            )
-            t_update.join()
+        if self.accelerator.is_main_process:
+            self.rollout_worker.send_weights(self._streaming_iter())
         else:
-            # Non-rank-0 processes must still participate in full_tensor() collectives.
-            for _ in _streaming_iter():
+            # Non-rank-0 processes must still participate in full_tensor() collectives for FSDP2.
+            for _ in self._streaming_iter():
                 pass
         t_transfer = time.time()
 
@@ -606,23 +543,14 @@ class AsyncGRPOTrainer(Trainer):
 
         logger.info(f"Weight sync: resuming vLLM... (transfer took {t_transfer - t_barrier:.1f}s)")
         if self.accelerator.is_main_process:
-            requests.post(f"{self.vllm_server_url}/resume")
+            self.rollout_worker.resume()
             self.model_version += 1
-            if self.rollout_worker:
-                self.rollout_worker.update_model_version(self.model_version)
+            self.rollout_worker.update_model_version(self.model_version)
         logger.info(f"Weight sync: done. Total {time.time() - t0:.1f}s")
 
     def _inner_training_loop(self, *args, **kwargs):
-        if self.accelerator.is_main_process:
-            self._init_weight_transfer()
         try:
             return super()._inner_training_loop(*args, **kwargs)
         finally:
-            if self.accelerator.is_main_process and self._worker_stop_event:
-                # Schedule stop_event.set() in the worker's event loop
-                logger.info("Stopping worker thread...")
-                if self._worker_loop and self._worker_loop.is_running():
-                    try:
-                        self._worker_loop.call_soon_threadsafe(self._worker_stop_event.set)
-                    except RuntimeError:
-                        pass
+            if self.accelerator.is_main_process and self.rollout_worker:
+                self.rollout_worker.stop()
