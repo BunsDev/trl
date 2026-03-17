@@ -26,9 +26,10 @@ from accelerate.logging import get_logger
 from datasets import Dataset, IterableDataset
 from torch.distributed._tensor import DTensor
 from torch.utils.data import DataLoader
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase, Trainer, TrainerCallback
+from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase, TrainerCallback
 from transformers.data.data_collator import DataCollatorMixin
 
+from trl.trainer.base_trainer import _BaseTrainer
 from trl.trainer.utils import pad, selective_log_softmax
 
 from .async_grpo_config import AsyncGRPOConfig
@@ -153,7 +154,7 @@ class DataCollatorForRollout(DataCollatorMixin):
         }
 
 
-class AsyncGRPOTrainer(Trainer):
+class AsyncGRPOTrainer(_BaseTrainer):
     """
     Trainer for the Async Group Relative Policy Optimization (AsyncGRPO) method. This algorithm was initially proposed
     in the paper [DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language
@@ -287,6 +288,14 @@ class AsyncGRPOTrainer(Trainer):
         # Reward functions
         if not isinstance(reward_funcs, list):
             reward_funcs = [reward_funcs]
+
+        # Infer max_steps from dataset size when not explicitly set
+        if self.args.max_steps <= 0 and train_dataset is not None and hasattr(train_dataset, "__len__"):
+            samples_per_epoch = len(train_dataset) * self.args.num_generations
+            steps_per_epoch = samples_per_epoch / (
+                self.args.per_device_train_batch_size * self.args.gradient_accumulation_steps
+            )
+            self.args.max_steps = int(self.args.num_train_epochs * steps_per_epoch)
 
         # Initialize the Trainer
         super().__init__(

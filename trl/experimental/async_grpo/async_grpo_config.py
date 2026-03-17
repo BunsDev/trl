@@ -195,7 +195,3 @@ class AsyncGRPOConfig(_BaseConfig):
         else:
             self.accelerator_config.split_batches = True
             self.accelerator_config.dispatch_batches = True
-
-        # max_steps is required because the dataset is an IterableDataset (no len(dataloader))
-        if getattr(self, "max_steps", -1) <= 0:
-            raise ValueError("max_steps must be > 0 for async RL training")

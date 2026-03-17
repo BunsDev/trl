@@ -62,8 +62,8 @@ class RolloutGroup:
 @dataclass(slots=True)
 class RolloutSample:
     prompt: Prompt
-    input_ids: list[int]
     completion: list[dict[str, str]]
+    input_ids: list[int]
     completion_mask: list[int]
     old_log_probs: list[float]
     advantage: float
@@ -594,8 +594,8 @@ class AsyncRolloutWorker:
         return [
             RolloutSample(
                 prompt=group.prompt,
-                input_ids=group.prompt_ids + completion_ids,
                 completion=completion,
+                input_ids=group.prompt_ids + completion_ids,
                 completion_mask=[0] * len(group.prompt_ids) + tool_mask,
                 old_log_probs=[0.0] * len(group.prompt_ids) + logprobs,
                 advantage=advantage,
