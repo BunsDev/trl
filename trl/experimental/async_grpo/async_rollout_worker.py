@@ -469,7 +469,7 @@ class AsyncRolloutWorker:
             group_id += 1
 
     async def _generate_one(
-        self, prompt: Prompt, tool_dict: dict[str, Callable]
+        self, prompt: Messages, tool_dict: dict[str, Callable]
     ) -> tuple[list[dict[str, str]], list[int], list[float], list[int], int, int]:
         completion, completion_ids, completion_logprobs, tool_mask = [], [], [], []
         tool_call_count = 0
