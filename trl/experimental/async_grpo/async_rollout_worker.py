@@ -27,17 +27,15 @@ import requests
 from accelerate.logging import get_logger
 from datasets import Dataset
 from transformers import AutoTokenizer
+
 from trl.import_utils import is_vllm_available
+
 
 if is_vllm_available():
     from vllm.distributed.weight_transfer.nccl_engine import NCCLTrainerSendWeightsArgs, NCCLWeightTransferEngine
     from vllm.utils.network_utils import get_ip, get_open_port
 
-from trl.chat_template_utils import (
-    add_response_schema,
-    get_training_chat_template,
-    parse_response,
-)
+from trl.chat_template_utils import add_response_schema, get_training_chat_template, parse_response
 from trl.trainer.utils import print_prompt_completions_sample
 
 
