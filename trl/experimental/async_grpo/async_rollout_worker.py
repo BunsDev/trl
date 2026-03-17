@@ -30,15 +30,12 @@ from transformers import AutoTokenizer
 
 from trl.chat_template_utils import add_response_schema, get_training_chat_template, parse_response
 from trl.trainer.utils import print_prompt_completions_sample
+from trl.import_utils import is_vllm_available
 
-
-try:
+if is_vllm_available(min_version="0.17.1"):
     from vllm.distributed.weight_transfer.nccl_engine import NCCLTrainerSendWeightsArgs, NCCLWeightTransferEngine
     from vllm.utils.network_utils import get_ip, get_open_port
-except ImportError as e:
-    raise ImportError(
-        "vLLM is required to use AsyncGRPOTrainer. Please install it with `pip install trl[vllm]`."
-    ) from e
+
 
 logger = get_logger(__name__)
 
@@ -104,6 +101,10 @@ class AsyncRolloutWorker:
         weight_dtype_names: list[str] | None = None,
         weight_shapes: list[list[int]] | None = None,
     ):
+        if not is_vllm_available(min_version="0.17.1"):
+            raise ImportError(
+                "vLLM >= 0.17.1 is required to use AsyncRolloutWorker. Install it with: pip install 'vllm>=0.17.1'"
+            )
         self.model_name = model_name
         self.dataset = dataset
         self._dataset_iter = iter(dataset)
