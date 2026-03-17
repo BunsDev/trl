@@ -32,7 +32,7 @@ class AsyncGRPOConfig(_BaseConfig):
 
         num_generations (`int`, *optional*, defaults to `8`):
             Number of generations per prompt to sample.
-        max_completion_length (`int`, *optional*, defaults to `8192`):
+        max_completion_length (`int`, *optional*, defaults to `2048`):
             Maximum number of tokens to generate per completion.
         temperature (`float`, *optional*, defaults to `1.0`):
             Temperature for sampling. The higher the temperature, the more random the completions.
@@ -102,7 +102,7 @@ class AsyncGRPOConfig(_BaseConfig):
         metadata={"help": "Number of generations per prompt to sample."},
     )
     max_completion_length: int = field(
-        default=8192,
+        default=2048,
         metadata={"help": "Maximum number of tokens to generate per completion."},
     )
     temperature: float = field(
