@@ -40,17 +40,17 @@ if is_vllm_available(min_version="0.17.1"):
 
 logger = get_logger(__name__)
 
-Prompt: TypeAlias = list[dict[str, str]]
+Messages: TypeAlias = list[dict[str, str]]
 
 
 @dataclass(slots=True)
 class RolloutGroup:
     """Single GRPO group for one prompt with multiple completions."""
 
-    prompt: Prompt
+    prompt: Messages
     prompt_ids: list[int]
     reward_kwargs: dict[str, list[Any]]
-    completions: list[list[dict[str, str]]]
+    completions: list[Messages]
     completions_ids: list[list[int]]
     completions_logprobs: list[list[float]]
     tool_mask: list[list[int]]
@@ -62,8 +62,8 @@ class RolloutGroup:
 
 @dataclass(slots=True)
 class RolloutSample:
-    prompt: Prompt
-    completion: list[dict[str, str]]
+    prompt: Messages
+    completion: Messages
     input_ids: list[int]
     completion_mask: list[int]
     old_log_probs: list[float]
