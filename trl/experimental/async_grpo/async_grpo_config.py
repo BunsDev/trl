@@ -146,10 +146,13 @@ class AsyncGRPOConfig(_BaseConfig):
 
     # Parameters that control the async rollout pipeline
     max_inflight_tasks: int = field(
-        default=128,
+        default=-1,
         metadata={
-            "help": "Maximum number of concurrent generation tasks. If no environment is used, set this to the vLLM "
-            "`max-num-seqs`; otherwise, set it depending on how many parallel environments you can run."
+            "help": "Maximum number of concurrent generation tasks sent to the vLLM server. Defaults to -1 (auto), "
+            "which sets it to `max_staleness * per_device_train_batch_size * gradient_accumulation_steps * "
+            "num_processes`. Generating more samples than this is wasteful since they will be discarded as stale "
+            "before the trainer can consume them. If using tool-use environments, you may want to set this manually "
+            "based on how many parallel environments you can run."
         },
     )
     max_staleness: int = field(

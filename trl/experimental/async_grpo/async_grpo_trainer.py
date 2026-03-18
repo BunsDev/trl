@@ -316,14 +316,23 @@ class AsyncGRPOTrainer(_BaseTrainer):
 
         # Infer max_steps from dataset size when not explicitly set. This must happen after super().__init__()
         # so that self.accelerator.num_processes is available for the correct calculation.
+        samples_per_step = (
+            self.args.per_device_train_batch_size
+            * self.args.gradient_accumulation_steps
+            * self.accelerator.num_processes
+        )
         if self.args.max_steps <= 0 and train_dataset is not None and hasattr(train_dataset, "__len__"):
             samples_per_epoch = len(train_dataset) * self.args.num_generations
-            samples_per_step = (
-                self.args.per_device_train_batch_size
-                * self.args.gradient_accumulation_steps
-                * self.accelerator.num_processes
-            )
             self.args.max_steps = int(self.args.num_train_epochs * samples_per_epoch / samples_per_step)
+
+        # Infer max_inflight_tasks when not explicitly set. Generating more samples than the trainer can consume
+        # before they become stale is wasteful. The useful upper bound is max_staleness * samples_per_step.
+        if self.args.max_inflight_tasks < 0:
+            self.args.max_inflight_tasks = self.args.max_staleness * samples_per_step
+            logger.info(
+                f"max_inflight_tasks set to {self.args.max_inflight_tasks} "
+                f"(max_staleness={self.args.max_staleness} × samples_per_step={samples_per_step})"
+            )
 
         # Initialize the metrics
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
