@@ -167,10 +167,11 @@ class DataCollatorForRollout(DataCollatorMixin):
 
 class AsyncGRPOTrainer(_BaseTrainer):
     """
-    Trainer for the Async Group Relative Policy Optimization (AsyncGRPO) method. This algorithm was initially proposed
-    in the paper [DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language
-    Models](https://huggingface.co/papers/2402.03300). Generation is offloaded to an external vLLM server that runs
-    asynchronously alongside training, decoupling rollout from the gradient update loop.
+    Trainer for the Group Relative Policy Optimization (GRPO) method. This algorithm was initially proposed in the
+    paper [DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language
+    Models](https://huggingface.co/papers/2402.03300). This trainer is the asynchronous version of GRPO, where
+    generation is offloaded to an external vLLM server that runs asynchronously alongside training, decoupling rollout
+    from the gradient update loop.
 
     Example:
 

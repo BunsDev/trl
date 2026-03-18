@@ -88,7 +88,7 @@
   - local: openenv
     title: OpenEnv Integration
   - local: async_grpo_trainer # Sorted alphabetically
-    title: Async GRPO
+    title: Asynchronous GRPO
   - local: bema_for_reference_model
     title: BEMA for Reference Model
   - local: bco_trainer

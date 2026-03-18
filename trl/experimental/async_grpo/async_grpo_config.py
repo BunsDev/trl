@@ -23,9 +23,9 @@ class AsyncGRPOConfig(_BaseConfig):
     r"""
     Configuration class for the [`AsyncGRPOTrainer`].
 
-    This class includes only the parameters that are specific to Async GRPO training. For a full list of training
-    arguments, please refer to the [`~transformers.TrainingArguments`] documentation. Note that default values in this
-    class may differ from those in [`~transformers.TrainingArguments`].
+    This class includes only the parameters that are specific to asynchronous GRPO training. For a full list of
+    training arguments, please refer to the [`~transformers.TrainingArguments`] documentation. Note that default values
+    in this class may differ from those in [`~transformers.TrainingArguments`].
 
     Parameters:
         > Parameters that control generation

@@ -74,7 +74,7 @@ class RolloutSample:
 
 class AsyncRolloutWorker:
     """
-    Minimal async actor worker structure.
+    Minimal asynchronous actor worker structure.
 
     Loop:
         generate groups -> score groups -> push samples -> repeat
@@ -147,7 +147,7 @@ class AsyncRolloutWorker:
         for i in range(self.max_inflight_tasks):
             for tool in base_tools + (environment_methods[i] if self.environments is not None else []):
                 if inspect.iscoroutinefunction(tool):
-                    raise ValueError("Async tools are not supported in AsyncRolloutWorker yet.")
+                    raise ValueError("Asynchronous tools are not supported in AsyncRolloutWorker yet.")
                 self._sync_tool_dicts[i][tool.__name__] = tool
         self.tools = base_tools + (environment_methods[0] if self.environments is not None else [])
 

@@ -1,4 +1,4 @@
-# Async GRPO
+# Asynchronous GRPO
 
 > [!IMPORTANT]
 > This trainer requires `vllm>=0.17.1` and `transformers>=5.2.0`. For distributed training, only FSDP2 is supported (DeepSpeed ZeRO is not).
