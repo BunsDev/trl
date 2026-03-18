@@ -406,7 +406,14 @@ class AsyncRolloutWorker:
 
                     if pending_completed[group_id] == self.num_generations:
                         group.queued_at = time.monotonic()
-                        await self._groups_to_score.put(group)
+                        while True:
+                            try:
+                                self._groups_to_score.put_nowait(group)
+                                break
+                            except asyncio.QueueFull:
+                                if stop_event.is_set():
+                                    return
+                                await asyncio.sleep(0.1)
                         logger.debug(f"Group {group_id} complete; queued_for_scoring={self._groups_to_score.qsize()}")
                         del pending_groups[group_id]
                         del pending_completed[group_id]
@@ -415,7 +422,12 @@ class AsyncRolloutWorker:
                 task.cancel()
             if inflight_tasks:
                 await asyncio.gather(*inflight_tasks, return_exceptions=True)
-            await self._groups_to_score.put(None)
+            # Use put_nowait: if the queue is full at shutdown, skip the sentinel —
+            # _score_loop will exit via stop_event anyway.
+            try:
+                self._groups_to_score.put_nowait(None)
+            except asyncio.QueueFull:
+                pass
 
     def _compute_rollout_metrics(self, samples: list[RolloutSample], scoring_time: float, wait_scoring: float) -> None:
         assert self._generation_start_time is not None, "generation_start_time init in run()"
