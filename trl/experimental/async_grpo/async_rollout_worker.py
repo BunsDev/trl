@@ -713,7 +713,6 @@ class AsyncRolloutWorker:
             turn_ids, turn_logprobs = await self._generate_one_turn(prompt_ids, max_tokens=effective_max_tokens)
             assistant_message = parse_response(self.tokenizer, turn_ids)
             completion.append(assistant_message)
-            iteration_num += 1
             completion_ids.extend(turn_ids)
             completion_logprobs.extend(turn_logprobs)
             tool_mask.extend([1] * len(turn_ids))
@@ -739,7 +738,6 @@ class AsyncRolloutWorker:
             completion_logprobs.extend([0.0] * len(tool_suffix_ids))
             tool_mask.extend([0] * len(tool_suffix_ids))
             prompt_ids = prompt_ids + turn_ids + tool_suffix_ids
-            iteration_num += 1
 
             if self.max_model_len is not None and len(prompt_ids) >= self.max_model_len:
                 logger.warning(
