@@ -597,9 +597,9 @@ class AsyncRolloutWorker:
             try:
                 output = await self._post("/v1/completions", payload, self.request_timeout)
                 break
-            except (aiohttp.ServerDisconnectedError, aiohttp.ClientConnectionError):
-                # vLLM drops connections during weight sync (/pause). Wait briefly and retry.
-                logger.debug("Server disconnected (likely weight sync pause), retrying...")
+            except (aiohttp.ServerDisconnectedError, aiohttp.ClientConnectionError, aiohttp.ClientResponseError):
+                # vLLM drops connections or returns 503 during weight sync (/pause). Wait briefly and retry.
+                logger.debug("Server unavailable (likely weight sync pause), retrying...")
                 await asyncio.sleep(1.0)
         choice = output["choices"][0]
         completion_ids = choice["token_ids"]
