@@ -418,7 +418,7 @@ class AsyncRolloutWorker:
                         # Current assumption: reset side effects matter, return value is ignored.
                         self.environments[slot].reset(**row)
 
-                    logger.info(f"[slot] assigned slot={slot} group={group_id} free_after={len(free_slots)}")
+                    logger.debug(f"[slot] assigned slot={slot} group={group_id} free_after={len(free_slots)}")
                     task = asyncio.create_task(
                         self._generate_one(pending_groups[group_id].prompt, tool_dict=self._sync_tool_dicts[slot])
                     )
