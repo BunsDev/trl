@@ -705,16 +705,3 @@ class AsyncRolloutWorker:
                     await asyncio.sleep(1)
                 else:
                     raise
-
-    async def _get_status_code(self, path: str, timeout: float = 30, max_retries: int = 3) -> int:
-        client_timeout = aiohttp.ClientTimeout(total=timeout)
-        for attempt in range(max_retries):
-            try:
-                async with self.session.get(f"{self.vllm_server_url}{path}", timeout=client_timeout) as response:
-                    return response.status
-            except (TimeoutError, asyncio.TimeoutError):
-                if attempt < max_retries - 1:
-                    logger.warning(f"GET {path} timed out (attempt {attempt + 1}/{max_retries}), retrying...")
-                    await asyncio.sleep(1)
-                else:
-                    raise
