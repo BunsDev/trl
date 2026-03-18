@@ -15,7 +15,6 @@
 """
 CUDA_VISIBLE_DEVICES=1 VLLM_SERVER_DEV_MODE=1 vllm serve Qwen/Qwen3-4B \
     --weight-transfer-config '{"backend":"nccl"}' \
-    --max-num-seqs 64 \
     --max-model-len 9216
 
 LOG_LEVEL=DEBUG CUDA_VISIBLE_DEVICES=0 accelerate launch examples/scripts/async_grpo.py
