@@ -275,7 +275,9 @@ class AsyncRolloutWorker:
         logger.debug(f"[weight_sync] NCCL transfer took {time.time() - t_nccl:.1f}s")
         t_join = time.time()
         t_update.join()
-        logger.debug(f"[weight_sync] /update_weights join took {time.time() - t_join:.1f}s (total send_weights: {time.time() - t0:.1f}s)")
+        logger.debug(
+            f"[weight_sync] /update_weights join took {time.time() - t_join:.1f}s (total send_weights: {time.time() - t0:.1f}s)"
+        )
 
     async def _wait_for_server_ready(
         self,
@@ -473,7 +475,9 @@ class AsyncRolloutWorker:
                         if stop_event.is_set():
                             return
                         # Wait for trainer to consume loop
-                        logger.info(f"[score] rollout buffer full (maxsize={self.rollout_buffer.maxsize}), waiting for trainer to consume...")
+                        logger.info(
+                            f"[score] rollout buffer full (maxsize={self.rollout_buffer.maxsize}), waiting for trainer to consume..."
+                        )
                         await asyncio.sleep(0.1)
 
             logger.debug(

@@ -66,6 +66,7 @@ class StepIntervalCallback(TrainerCallback):
     """
     A callback that calls a function every N optimization steps.
     """
+
     def __init__(self, fn, every_n_steps: int):
         self.fn = fn
         self.every_n_steps = every_n_steps
