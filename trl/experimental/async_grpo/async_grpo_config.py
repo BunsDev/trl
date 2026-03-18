@@ -47,7 +47,7 @@ class AsyncGRPOConfig(_BaseConfig):
 
         vllm_server_base_url (`str`, *optional*, defaults to `"http://localhost:8000"`):
             Base URL of the vLLM server used for generation (e.g., `"http://localhost:8000"`).
-        vllm_server_timeout (`float`, *optional*, defaults to `300.0`):
+        vllm_server_timeout (`float`, *optional*, defaults to `240.0`):
             Total timeout duration in seconds to wait for the vLLM server to be ready.
         request_timeout (`int`, *optional*, defaults to `600`):
             Timeout in seconds for individual HTTP requests to the vLLM server.
@@ -61,9 +61,11 @@ class AsyncGRPOConfig(_BaseConfig):
 
         > Parameters that control the async rollout pipeline
 
-        max_inflight_tasks (`int`, *optional*, defaults to `128`):
-            Maximum number of concurrent generation tasks. If no environment is used, set this to the vLLM
-            `max-num-seqs`; otherwise, set it depending on how many parallel environments you can run.
+        max_inflight_tasks (`int`, *optional*, defaults to `-1`):
+            Maximum number of concurrent generation tasks sent to the vLLM server. Defaults to `-1` (auto), which
+            sets it to `max_staleness * per_device_train_batch_size * gradient_accumulation_steps * num_processes`.
+            If using tool-use environments, you may want to set this manually based on how many parallel environments
+            you can run.
         max_staleness (`int`, *optional*, defaults to `4`):
             Maximum number of weight update steps a rollout sample can lag behind the current model version before
             being discarded.
