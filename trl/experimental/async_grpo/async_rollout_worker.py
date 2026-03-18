@@ -171,27 +171,32 @@ class AsyncRolloutWorker:
         self.model_version = 0
         self.session = None
 
-    def update_model_version(self, model_version: int):
-        self.model_version = model_version
+        # Wait for the vLLM server and initialize NCCL weight transfer.
+        self._wait_for_server_ready_sync(timeout_s=self.server_timeout)
+        self._init_weight_transfer()
 
-    async def run(self, stop_event: asyncio.Event | None = None) -> None:
-        if stop_event is None:
-            stop_event = asyncio.Event()
-
-        async with aiohttp.ClientSession() as session:
-            self.session = session
-            await self._wait_for_server_ready(stop_event=stop_event, timeout_s=self.server_timeout)
-            if stop_event.is_set():
-                return
-            self._init_weight_transfer()
-            logger.info(
-                f"vllm worker started: num_generations={self.num_generations}, max_inflight_tasks={self.max_inflight_tasks}"
-            )
-
-            await asyncio.gather(
-                asyncio.create_task(self._generate_loop(stop_event=stop_event)),
-                asyncio.create_task(self._score_loop(stop_event=stop_event)),
-            )
+    def _wait_for_server_ready_sync(self, timeout_s: float = 240.0, poll_interval_s: float = 2.0) -> None:
+        """Block until the vLLM server is healthy."""
+        logger.info(f"Waiting for vLLM server at {self.vllm_server_url} ...")
+        start = time.time()
+        while True:
+            elapsed = time.time() - start
+            try:
+                response = requests.get(f"{self.vllm_server_url}/health", timeout=5)
+                if response.status_code == 200:
+                    logger.info(f"vLLM server ready after {elapsed:.1f}s")
+                    return
+            except (requests.ConnectionError, requests.Timeout, OSError):
+                pass
+            if elapsed >= timeout_s:
+                raise TimeoutError(
+                    f"Timed out after {timeout_s:.0f}s waiting for vLLM server at {self.vllm_server_url}. "
+                    "Make sure the vLLM server is running and reachable. If the server needs more time to load "
+                    "the model, increase `vllm_server_timeout` in your AsyncGRPOConfig."
+                )
+            if int(elapsed) % 10 < poll_interval_s:
+                logger.info(f"Still waiting for vLLM server... ({elapsed:.0f}s)")
+            time.sleep(poll_interval_s)
 
     def _init_weight_transfer(self) -> None:
         response = requests.get(f"{self.vllm_server_url}/get_world_size")
@@ -223,6 +228,20 @@ class AsyncRolloutWorker:
 
         logger.info("Init weight sync group with vLLM")
 
+    def update_model_version(self, model_version: int):
+        self.model_version = model_version
+
+    async def _run_loops(self, stop_event: asyncio.Event) -> None:
+        async with aiohttp.ClientSession() as session:
+            self.session = session
+            logger.info(
+                f"vllm worker started: num_generations={self.num_generations}, max_inflight_tasks={self.max_inflight_tasks}"
+            )
+            await asyncio.gather(
+                asyncio.create_task(self._generate_loop(stop_event=stop_event)),
+                asyncio.create_task(self._score_loop(stop_event=stop_event)),
+            )
+
     def start(self) -> None:
         thread = threading.Thread(target=self._run, daemon=True)
         thread.start()
@@ -241,7 +260,7 @@ class AsyncRolloutWorker:
         self._loop = loop
         self._stop_event = asyncio.Event()
         try:
-            loop.run_until_complete(self.run(stop_event=self._stop_event))
+            loop.run_until_complete(self._run_loops(stop_event=self._stop_event))
         except Exception as e:
             logger.exception(f"Worker thread failed: {e}")
             raise
@@ -280,35 +299,6 @@ class AsyncRolloutWorker:
         logger.debug(
             f"[weight_sync] /update_weights join took {time.time() - t_join:.1f}s (total send_weights: {time.time() - t0:.1f}s)"
         )
-
-    async def _wait_for_server_ready(
-        self,
-        stop_event: asyncio.Event,
-        timeout_s: float = 240.0,
-        poll_interval_s: float = 2.0,
-    ) -> None:
-        """Block startup until the vLLM server exposes the custom trainer endpoints."""
-        logger.info(f"Waiting for vLLM server at {self.vllm_server_url} ...")
-        start = asyncio.get_running_loop().time()
-        while not stop_event.is_set():
-            elapsed = asyncio.get_running_loop().time() - start
-            try:
-                status_code = await self._get_status_code("/health", 5)
-                if status_code == 200:
-                    logger.info(f"vLLM server ready after {elapsed:.1f}s")
-                    return
-            except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
-                pass
-
-            if elapsed >= timeout_s:
-                raise TimeoutError(
-                    f"Timed out after {timeout_s:.0f}s waiting for vLLM server at {self.vllm_server_url}. "
-                    "Make sure the vLLM server is running and reachable. If the server needs more time to load "
-                    "the model, increase `vllm_server_timeout` in your AsyncGRPOConfig."
-                )
-            if int(elapsed) % 10 < poll_interval_s:
-                logger.info(f"Still waiting for vLLM server... ({elapsed:.0f}s)")
-            await asyncio.sleep(poll_interval_s)
 
     async def _generate_loop(self, stop_event: asyncio.Event) -> None:
         pending_groups: dict[int, RolloutGroup] = {}
@@ -423,7 +413,7 @@ class AsyncRolloutWorker:
             if inflight_tasks:
                 await asyncio.gather(*inflight_tasks, return_exceptions=True)
             # Use put_nowait: if the queue is full at shutdown, skip the sentinel —
-            # _score_loop will exit via stop_event anyway.
+            # _score_loop will exit via stop_event check in its outer loop.
             try:
                 self._groups_to_score.put_nowait(None)
             except asyncio.QueueFull:
@@ -450,9 +440,12 @@ class AsyncRolloutWorker:
         )
 
     async def _score_loop(self, stop_event: asyncio.Event) -> None:
-        while True:
+        while not stop_event.is_set():
             t_wait = time.monotonic()
-            group = await self._groups_to_score.get()
+            try:
+                group = await asyncio.wait_for(self._groups_to_score.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
             if group is None:
                 return
             score_queue_wait = time.monotonic() - t_wait

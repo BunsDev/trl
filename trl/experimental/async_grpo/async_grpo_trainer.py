@@ -379,7 +379,6 @@ class AsyncGRPOTrainer(_BaseTrainer):
                     weight_dtype_names=weight_dtype_names,
                     weight_shapes=weight_shapes,
                 )
-            self.rollout_worker.start()
             self.rollout_queue = self.rollout_worker.rollout_buffer
         else:
             self.rollout_queue = None
@@ -589,6 +588,13 @@ class AsyncGRPOTrainer(_BaseTrainer):
         logger.info(f"Weight sync: done. Total {weight_sync_time_s:.1f}s")
 
     def _inner_training_loop(self, *args, **kwargs):
+        # Start the rollout worker here (not in __init__) so that checkpoint loading in Trainer.train()
+        # has already restored the model weights. The sequence is: start worker thread → wait for NCCL
+        # init → sync weights to vLLM → begin generation. This ensures vLLM always uses the current
+        # policy before producing any samples (matters for resumed runs, harmless for fresh ones).
+        self._sync_weight()
+        if self.accelerator.is_main_process and self.rollout_worker:
+            self.rollout_worker.start()
         try:
             return super()._inner_training_loop(*args, **kwargs)
         finally:
