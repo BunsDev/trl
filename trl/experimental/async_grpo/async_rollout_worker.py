@@ -942,6 +942,7 @@ class AsyncRolloutWorker:
                         "reward": float(reward),
                         "reward_mean": float(reward_mean),
                         "reward_std": reward_std,
+                        "advantage": advantage,
                         **{
                             f"rewards/{name}": float(func_reward)
                             for name, func_reward in zip(self.reward_func_names, per_func_rewards[:, i], strict=True)
