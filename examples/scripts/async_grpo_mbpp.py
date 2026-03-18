@@ -49,6 +49,7 @@ class MBPPEnvironment:
 
     def __init__(self):
         self.test_list = []
+        self.done = False
 
     def reset(self, test_list: list[str], **kwargs):
         """
@@ -56,12 +57,16 @@ class MBPPEnvironment:
         `**kwargs` ignores additional columns sent from the dataset map.
         """
         self.test_list = test_list
+        self.done = False
 
     def execute_python_code(self, code: str) -> str:
         """Execute python code to test against the hidden test cases. Provide the complete python code.
 
         Args:
             code: The complete python code to execute.
+
+        Returns:
+            program stdout string
         """
         full_code = code + "\n\n" + "\n".join(self.test_list)
 
@@ -77,6 +82,7 @@ class MBPPEnvironment:
                 timeout=3.0,
             )
             if result.returncode == 0:
+                self.done = True
                 return "Tests passed."
             else:
                 # Return the last 2000 characters of the stderr to fit within context length
@@ -87,6 +93,9 @@ class MBPPEnvironment:
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
+
+    def is_done(self) -> bool:
+        return self.done
 
 
 def tests_passed_reward(completions, **kwargs) -> list[float]:
@@ -133,10 +142,10 @@ def main() -> None:
         output_dir="./results",
         per_device_train_batch_size=1,
         max_completion_length=8192,
-        max_steps=1000,
-        max_staleness=5,
-        # max_inflight_tasks = max_staleness × per_device_train_batch_size × gradient_accumulation_steps × num_processes
-        max_inflight_tasks=5 * 1 * 1 * 2,
+        max_seq_length=8192,
+        max_tool_calling_iterations=5,
+        max_steps=100,
+        max_staleness=8,
         # Logging
         log_completions=True,
         num_completions_to_print=2,

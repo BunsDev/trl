@@ -747,7 +747,7 @@ def parse_response(tokenizer: PreTrainedTokenizer, ids: list[int]) -> dict:
         # Validate tool_calls to prevent Jinja2 Undefined errors when fields are missing
         if "tool_calls" in parsed:
             _validate_tool_calls(parsed["tool_calls"])
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, AttributeError):
         # Fallback: decode as plain text if parsing fails. This happens if the model outputs malformed tool calls.
         content = tokenizer.decode(ids, skip_special_tokens=True)
         parsed = {"role": "assistant", "content": content}
