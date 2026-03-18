@@ -96,6 +96,7 @@ class AsyncRolloutWorker:
         request_timeout: int = 120,
         server_timeout: float = 240.0,
         chat_template_kwargs: dict[str, Any] | None = None,
+        max_tool_calling_iterations: int | None = None,
         log_completions: bool = False,
         num_completions_to_print: int = 3,
         weight_names: list[str] | None = None,
@@ -107,6 +108,7 @@ class AsyncRolloutWorker:
                 "vLLM >= 0.17.1 is required to use AsyncRolloutWorker. Install it with: pip install 'vllm>=0.17.1'"
             )
         self.model_name = model_name
+        self.max_tool_calling_iterations = max_tool_calling_iterations
         self.dataset = dataset
         self._dataset_iter = iter(dataset)
         self.rollout_buffer: queue.Queue[RolloutSample] = queue.Queue(maxsize=queue_maxsize)
@@ -502,6 +504,8 @@ class AsyncRolloutWorker:
         completion, completion_ids, completion_logprobs, tool_mask = [], [], [], []
         tool_call_count = 0
         tool_failure_count = 0
+        iteration_num = 0
+        max_iterations = self.max_tool_calling_iterations
         prompt_ids = self.tokenizer.apply_chat_template(
             prompt,
             return_dict=False,
@@ -518,7 +522,7 @@ class AsyncRolloutWorker:
             completion_logprobs.extend(turn_logprobs)
             tool_mask.extend([1] * len(turn_ids))
             tool_calls = assistant_message.get("tool_calls")
-            if tool_calls is None:
+            if tool_calls is None or (max_iterations is not None and iteration_num >= max_iterations):
                 return completion, completion_ids, completion_logprobs, tool_mask, tool_call_count, tool_failure_count
 
             tool_messages, n_calls, n_failures = self._execute_tool_calls(tool_calls, tool_dict)
@@ -530,6 +534,7 @@ class AsyncRolloutWorker:
             completion_logprobs.extend([0.0] * len(tool_suffix_ids))
             tool_mask.extend([0] * len(tool_suffix_ids))
             prompt_ids = prompt_ids + turn_ids + tool_suffix_ids
+            iteration_num += 1
 
     def _build_messages_suffix_ids(self, messages: list[dict[str, Any]]) -> list[int]:
         template_messages = [

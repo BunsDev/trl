@@ -38,6 +38,10 @@ class AsyncGRPOConfig(_BaseConfig):
             Temperature for sampling. The higher the temperature, the more random the completions.
         chat_template_kwargs (`dict[str, Any]`, *optional*):
             Additional keyword arguments to pass to the `apply_chat_template` function when generating completions.
+        max_tool_calling_iterations (`int`, *optional*):
+            Maximum number of tool-calling turns when training an agent. If `None`, there is no limit and generation
+            stops when the model generates a response turn with no tool calls or when the total response length reaches
+            `max_completion_length`.
 
         > Parameters that control the vLLM server
 
@@ -114,6 +118,14 @@ class AsyncGRPOConfig(_BaseConfig):
         metadata={
             "help": "Additional keyword arguments to pass to the `apply_chat_template` function when generating "
             "completions."
+        },
+    )
+    max_tool_calling_iterations: int | None = field(
+        default=None,
+        metadata={
+            "help": "Maximum number of tool-calling turns when training an agent. If `None`, there is no limit and "
+            "generation stops when the model generates a response turn with no tool calls or when the total response "
+            "length reaches `max_completion_length`."
         },
     )
 

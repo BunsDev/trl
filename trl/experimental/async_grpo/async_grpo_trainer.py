@@ -372,6 +372,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
                     request_timeout=self.args.request_timeout,
                     server_timeout=self.args.vllm_server_timeout,
                     chat_template_kwargs=self.args.chat_template_kwargs,
+                    max_tool_calling_iterations=self.args.max_tool_calling_iterations,
                     log_completions=self.args.log_completions,
                     num_completions_to_print=self.args.num_completions_to_print,
                     weight_names=weight_names,
