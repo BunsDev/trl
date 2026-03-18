@@ -609,8 +609,8 @@ class AsyncGRPOTrainer(_BaseTrainer):
         logger.info(f"Weight sync: done. Total {weight_sync_time_s:.1f}s")
 
     def _inner_training_loop(self, *args, **kwargs):
-        if self._trainer.accelerator.is_main_process and self._trainer.rollout_worker:
-            self._trainer.rollout_worker.start()
+        if self.accelerator.is_main_process and self.rollout_worker:
+            self.rollout_worker.start()
         try:
             return super()._inner_training_loop(*args, **kwargs)
         finally:
