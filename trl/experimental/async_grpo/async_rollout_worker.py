@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import heapq
 import inspect
 import queue
 import threading
@@ -107,7 +108,9 @@ class AsyncRolloutWorker:
         max_inflight_tasks: int = 128,
         queue_maxsize: int = 0,
         vllm_server_url: str = "http://localhost:8000",
-        max_tokens: int = 32,
+        max_completion_tokens: int = 1024,
+        max_seq_length: int | None = None,
+        max_staleness: int = 4,
         temperature: float = 1.0,
         request_timeout: int = 120,
         server_timeout: float = 240.0,
@@ -169,7 +172,9 @@ class AsyncRolloutWorker:
 
         self.vllm_server_url = vllm_server_url.rstrip("/")
         self.model_update_group = None
-        self.max_tokens = max_tokens
+        self.max_completion_tokens = max_completion_tokens
+        self.max_seq_length = max_seq_length
+        self.max_staleness = max_staleness
         self.temperature = temperature
         self.request_timeout = request_timeout
         self.max_model_len = None
@@ -187,6 +192,10 @@ class AsyncRolloutWorker:
         self._generation_start_time: float | None = None
         self.model_version = 0
         self.session = None
+
+        # re-initialised in _run to bind to the worker's loop
+        self._resume_event: asyncio.Event | None = None
+        self._version_updated: asyncio.Event | None = None
 
         # Wait for the vLLM server and initialize NCCL weight transfer.
         self._wait_for_server_ready_sync(timeout_s=self.server_timeout)
@@ -259,6 +268,8 @@ class AsyncRolloutWorker:
 
     def update_model_version(self, model_version: int):
         self.model_version = model_version
+        if self._loop and self._loop.is_running() and self._version_updated is not None:
+            self._loop.call_soon_threadsafe(self._version_updated.set)
 
     async def _run_loops(self, stop_event: asyncio.Event) -> None:
         async with aiohttp.ClientSession() as session:
@@ -288,6 +299,9 @@ class AsyncRolloutWorker:
         asyncio.set_event_loop(loop)
         self._loop = loop
         self._stop_event = asyncio.Event()
+        self._resume_event = asyncio.Event()
+        self._resume_event.set()
+        self._version_updated = asyncio.Event()
         try:
             loop.run_until_complete(self._run_loops(stop_event=self._stop_event))
         except Exception as e:
@@ -298,12 +312,18 @@ class AsyncRolloutWorker:
 
     def pause(self) -> None:
         t0 = time.time()
+        # Signal the generate loop to stop dispatching new requests before pausing vLLM.
+        if self._loop and self._loop.is_running() and self._resume_event is not None:
+            self._loop.call_soon_threadsafe(self._resume_event.clear)
         requests.post(f"{self.vllm_server_url}/pause", params={"mode": "keep"})
         logger.debug(f"[weight_sync] pause HTTP took {time.time() - t0:.1f}s")
 
     def resume(self) -> None:
         t0 = time.time()
         requests.post(f"{self.vllm_server_url}/resume")
+        # Signal the generate loop that it can dispatch new requests again.
+        if self._loop and self._loop.is_running() and self._resume_event is not None:
+            self._loop.call_soon_threadsafe(self._resume_event.set)
         logger.debug(f"[weight_sync] resume HTTP took {time.time() - t0:.1f}s")
 
     def send_weights(self, iterator) -> None:
@@ -336,11 +356,29 @@ class AsyncRolloutWorker:
         inflight_tasks: dict[asyncio.Task, tuple[int, int]] = {}
         free_slots = set(range(self.max_inflight_tasks))
         work_iter = self._repeat_iterator()
+        version_heap: list[tuple[int, int]] = []
 
         self._generation_start_time = time.monotonic()
         try:
             while True:
+                if self._resume_event is not None and not self._resume_event.is_set():
+                    logger.debug("[generate] paused, waiting for resume...")
+                    await self._resume_event.wait()
+                    logger.debug("[generate] resumed")
+
+                if self._version_updated is not None and self._version_updated.is_set():
+                    self._version_updated.clear()
+                    cancelled = self._cancel_stale_tasks(
+                        version_heap, pending_groups, pending_completed, pending_failures, inflight_tasks, free_slots
+                    )
+                    if cancelled > 0:
+                        logger.info(f"[staleness] cancelled {cancelled} stale in-flight task(s)")
+
                 while free_slots and not stop_event.is_set():
+                    # Re-check pause inside the dispatch loop to avoid sending requests right after a pause signal between slots
+                    if self._resume_event is not None and not self._resume_event.is_set():
+                        break
+
                     group_id, row = next(work_iter)
                     if group_id not in pending_groups:
                         prompt = row["prompt"]
@@ -372,6 +410,7 @@ class AsyncRolloutWorker:
                             model_version=self.model_version,
                         )
                         pending_completed[group_id] = 0
+                        heapq.heappush(version_heap, (self.model_version, group_id))
                         logger.debug(f"Started group {group_id}; pending_groups={len(pending_groups)}")
 
                     slot = free_slots.pop()
@@ -405,8 +444,14 @@ class AsyncRolloutWorker:
                     free_slots.add(slot)
                     logger.debug(f"[slot] freed   slot={slot} group={group_id} free_after={len(free_slots)}")
 
+                    if group_id not in pending_groups:
+                        continue
+
                     try:
                         result: RolloutCompletion = task.result()
+                    except asyncio.CancelledError:
+                        # Task was cancelled by stale-task cancellation — nothing to do.
+                        continue
                     except Exception:
                         logger.warning(
                             f"Generation failed for group {group_id}, marking group as failed",
@@ -464,6 +509,45 @@ class AsyncRolloutWorker:
             except asyncio.QueueFull:
                 pass
 
+    def _cancel_stale_tasks(
+        self,
+        version_heap: list[tuple[int, int]],
+        pending_groups: dict[int, RolloutGroup],
+        pending_completed: dict[int, int],
+        pending_failures: dict[int, int],
+        inflight_tasks: dict[asyncio.Task, tuple[int, int]],
+        free_slots: set[int],
+    ) -> int:
+        """Cancel in-flight tasks whose group model_version is too stale. Returns the number of tasks cancelled."""
+        stale_cutoff = self.model_version - self.max_staleness
+        stale_group_ids: set[int] = set()
+
+        while version_heap and version_heap[0][0] < stale_cutoff:
+            _, group_id = heapq.heappop(version_heap)
+            if group_id in pending_groups:
+                stale_group_ids.add(group_id)
+
+        if not stale_group_ids:
+            return 0
+
+        cancelled = 0
+        for task, (group_id, slot) in list(inflight_tasks.items()):
+            if group_id in stale_group_ids:
+                task.cancel()
+                del inflight_tasks[task]
+                free_slots.add(slot)
+                cancelled += 1
+
+        # Clean up the stale groups.
+        for group_id in stale_group_ids:
+            staleness = self.model_version - pending_groups[group_id].model_version
+            logger.info(f"[staleness] dropping stale group {group_id} (staleness={staleness})")
+            del pending_groups[group_id]
+            del pending_completed[group_id]
+            pending_failures.pop(group_id, None)
+
+        return cancelled
+
     def _compute_rollout_metrics(self, samples: list[RolloutSample], scoring_time: float, wait_scoring: float) -> None:
         assert self._generation_start_time is not None, "generation_start_time init in run()"
         elapsed = time.monotonic() - self._generation_start_time
@@ -499,6 +583,14 @@ class AsyncRolloutWorker:
 
             if score_queue_wait > 0.5:
                 logger.info(f"[score] waited {score_queue_wait:.1f}s for a group to score")
+
+            # Staleness pre-check: skip scoring if the group is already too stale to be useful.
+            staleness = self.model_version - group.model_version
+            if staleness > self.max_staleness:
+                logger.info(
+                    f"[score] dropping stale group before scoring (staleness={staleness}, max={self.max_staleness})"
+                )
+                continue
 
             t0 = time.monotonic()
             samples = await self._score_group(group)
@@ -566,13 +658,28 @@ class AsyncRolloutWorker:
             **self.chat_template_kwargs,
         )
 
-        # Check if the prompt + generation exceeds the max model length
-        max_len = (
-            self.max_model_len if self.max_model_len is not None else getattr(self.tokenizer, "model_max_length", None)
+        if self.max_model_len is not None and len(prompt_ids) >= self.max_model_len:
+            logger.warning(f"Prompt length {len(prompt_ids)} >= max_model_len {self.max_model_len}. Skipping sample.")
+            return RolloutCompletion(
+                completion=completion,
+                completion_ids=completion_ids,
+                completion_logprobs=completion_logprobs,
+                tool_mask=tool_mask,
+                tool_call_count=tool_call_count,
+                tool_failure_count=tool_failure_count,
+                truncated=True,
+                num_turns=iteration_num,
+            )
+
+        # Dynamically clip max_tokens based on max_seq_length so that prompt + completion <= max_seq_length.
+        effective_max_tokens = (
+            min(self.max_completion_tokens, self.max_seq_length - len(prompt_ids))
+            if self.max_seq_length
+            else self.max_completion_tokens
         )
-        if max_len is not None and len(prompt_ids) + self.max_tokens > max_len:
+        if effective_max_tokens <= 0:
             logger.warning(
-                f"Prompt length {len(prompt_ids)} + max_tokens {self.max_tokens} exceeds max_model_len {max_len}. Skipping sample."
+                f"Prompt length {len(prompt_ids)} >= max_seq_length {self.max_seq_length}. Skipping sample."
             )
             return RolloutCompletion(
                 completion=completion,
@@ -586,7 +693,7 @@ class AsyncRolloutWorker:
             )
 
         while True:
-            turn_ids, turn_logprobs = await self._generate_one_turn(prompt_ids)
+            turn_ids, turn_logprobs = await self._generate_one_turn(prompt_ids, max_tokens=effective_max_tokens)
             assistant_message = parse_response(self.tokenizer, turn_ids)
             completion.append(assistant_message)
             iteration_num += 1
@@ -617,10 +724,33 @@ class AsyncRolloutWorker:
             prompt_ids = prompt_ids + turn_ids + tool_suffix_ids
             iteration_num += 1
 
-            if max_len is not None and len(prompt_ids) + self.max_tokens > max_len:
+            # Re-check: can we still generate at least 1 token in the next turn?
+            if self.max_model_len is not None and len(prompt_ids) >= self.max_model_len:
                 logger.warning(
-                    f"Multi-turn prompt length {len(prompt_ids)} + max_tokens {self.max_tokens} "
-                    f"exceeds max_model_len {max_len}. Stopping generation early."
+                    f"Multi-turn prompt length {len(prompt_ids)} >= max_model_len {self.max_model_len}. "
+                    f"Stopping generation early."
+                )
+                return RolloutCompletion(
+                    completion=completion,
+                    completion_ids=completion_ids,
+                    completion_logprobs=completion_logprobs,
+                    tool_mask=tool_mask,
+                    tool_call_count=tool_call_count,
+                    tool_failure_count=tool_failure_count,
+                    truncated=True,
+                    num_turns=iteration_num,
+                )
+
+            effective_max_tokens = (
+                min(self.max_completion_tokens, self.max_seq_length - len(prompt_ids))
+                if self.max_seq_length
+                else self.max_completion_tokens
+            )
+
+            if effective_max_tokens <= 0:
+                logger.warning(
+                    f"Multi-turn prompt length {len(prompt_ids)} >= max_seq_length {self.max_seq_length}. "
+                    f"Stopping generation early."
                 )
                 return RolloutCompletion(
                     completion=completion,
@@ -678,12 +808,12 @@ class AsyncRolloutWorker:
         return tool_messages, n_calls, n_failures
 
     async def _generate_one_turn(
-        self, prompt_ids: list[int], max_generation_retry: int = 10
+        self, prompt_ids: list[int], max_tokens: int | None = None, max_generation_retry: int = 10
     ) -> tuple[list[int], list[float]]:
         payload = {
             "model": self.model_name,
             "prompt": prompt_ids,
-            "max_tokens": self.max_tokens,
+            "max_tokens": max_tokens if max_tokens is not None else self.max_completion_tokens,
             "temperature": self.temperature,
             "n": 1,
             "return_token_ids": True,
@@ -754,52 +884,59 @@ class AsyncRolloutWorker:
 
         per_func_rewards = np.array(all_rewards, dtype=float)  # shape (num_funcs, num_completions)
 
-        return [
-            RolloutSample(
-                prompt=group.prompt,
-                completion=completion,
-                input_ids=group.prompt_ids + completion_ids,
-                completion_mask=[0] * len(group.prompt_ids) + tool_mask,
-                old_log_probs=[0.0] * len(group.prompt_ids) + logprobs,
-                advantage=advantage,
-                model_version=group.model_version,
-                metrics={
-                    "reward": float(reward),
-                    "reward_std": reward_std,
-                    **{
-                        f"rewards/{name}": float(func_reward)
-                        for name, func_reward in zip(self.reward_func_names, per_func_rewards[:, i], strict=True)
-                    },
-                    **tm,
-                    "rollout/truncated": float(truncated),
-                    "rollout/num_turns": float(num_turns),
-                },
+        samples = []
+        for i, (
+            completion,
+            completion_ids,
+            logprobs,
+            tool_mask,
+            advantage,
+            reward,
+            tm,
+            truncated,
+            num_turns,
+        ) in enumerate(
+            zip(
+                group.completions,
+                group.completions_ids,
+                group.completions_logprobs,
+                group.tool_mask,
+                advantages,
+                rewards,
+                tool_metrics,
+                group.truncated,
+                group.num_turns,
+                strict=True,
             )
-            for i, (
-                completion,
-                completion_ids,
-                logprobs,
-                tool_mask,
-                advantage,
-                reward,
-                tm,
-                truncated,
-                num_turns,
-            ) in enumerate(
-                zip(
-                    group.completions,
-                    group.completions_ids,
-                    group.completions_logprobs,
-                    group.tool_mask,
-                    advantages,
-                    rewards,
-                    tool_metrics,
-                    group.truncated,
-                    group.num_turns,
-                    strict=True,
+        ):
+            seq_len = len(group.prompt_ids) + len(completion_ids)
+            if self.max_seq_length is not None and seq_len > self.max_seq_length:
+                logger.warning(f"Dropping overlong sample (seq_len={seq_len}, max_seq_length={self.max_seq_length})")
+                continue
+
+            samples.append(
+                RolloutSample(
+                    prompt=group.prompt,
+                    completion=completion,
+                    input_ids=group.prompt_ids + completion_ids,
+                    completion_mask=[0] * len(group.prompt_ids) + tool_mask,
+                    old_log_probs=[0.0] * len(group.prompt_ids) + logprobs,
+                    advantage=advantage,
+                    model_version=group.model_version,
+                    metrics={
+                        "reward": float(reward),
+                        "reward_std": reward_std,
+                        **{
+                            f"rewards/{name}": float(func_reward)
+                            for name, func_reward in zip(self.reward_func_names, per_func_rewards[:, i], strict=True)
+                        },
+                        **tm,
+                        "rollout/truncated": float(truncated),
+                        "rollout/num_turns": float(num_turns),
+                    },
                 )
             )
-        ]
+        return samples
 
     async def _post(self, path: str, payload: dict, timeout: float, max_retries: int = 3) -> dict:
         client_timeout = aiohttp.ClientTimeout(total=timeout)
