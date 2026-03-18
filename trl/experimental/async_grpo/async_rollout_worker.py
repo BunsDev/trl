@@ -382,6 +382,9 @@ class AsyncRolloutWorker:
                     group_id, slot = inflight_tasks.pop(task)
                     free_slots.add(slot)
                     logger.debug(f"[slot] freed   slot={slot} group={group_id} free_after={len(free_slots)}")
+                    if task.exception() is not None:
+                        raise task.exception()
+
                     (
                         completion,
                         completion_ids,
