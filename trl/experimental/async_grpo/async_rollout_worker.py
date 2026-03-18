@@ -248,8 +248,7 @@ class AsyncRolloutWorker:
 
     def pause(self) -> None:
         t0 = time.time()
-        # requests.post(f"{self.vllm_server_url}/pause", params={"mode": "keep"})
-        requests.post(f"{self.vllm_server_url}/pause", params={"mode": "abort", "clear_cache": True})
+        requests.post(f"{self.vllm_server_url}/pause", params={"mode": "keep"})
         logger.debug(f"[weight_sync] pause HTTP took {time.time() - t0:.1f}s")
 
     def resume(self) -> None:
