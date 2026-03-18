@@ -253,6 +253,13 @@ config = NemotronHConfig(
 )
 model = NemotronHForCausalLM(config).to(dtype=torch.bfloat16)
 init_weights_tiny_model(model)
+# NemotronH keeps mixer.D and mixer.A_log in float32 in the reference model; mirror that here.
+for layer in model.model.layers:
+    if hasattr(layer, "mixer"):
+        if hasattr(layer.mixer, "D"):
+            layer.mixer.D.data = layer.mixer.D.data.float()
+        if hasattr(layer.mixer, "A_log"):
+            layer.mixer.A_log.data = layer.mixer.A_log.data.float()
 push_to_hub(model, tokenizer, generation_config, "tiny")
 
 # Two slightly bigger models, required for vLLM testing

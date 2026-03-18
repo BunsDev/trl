@@ -297,13 +297,10 @@ class TestSFTTrainer(TrlTestCase):
         # Get the dataset
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
 
-        # NemotronH (hybrid Mamba-Attention) does not support gradient checkpointing. The Mamba CUDA
-        # kernels require strides to be multiples of 8, which is incompatible with tiny model dimensions.
-        # Force CPU so that the model uses the pure PyTorch path (works fine on GPU without kernels).
+        # NemotronH (hybrid Mamba-Attention) does not support gradient checkpointing
         kwargs = {}
         if "NemotronH" in model_id:
             kwargs["gradient_checkpointing"] = False
-            kwargs["use_cpu"] = True
 
         # Initialize the trainer
         training_args = SFTConfig(output_dir=self.tmp_dir, report_to="none", **kwargs)
