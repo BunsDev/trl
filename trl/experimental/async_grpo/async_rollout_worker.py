@@ -766,6 +766,8 @@ class AsyncRolloutWorker:
                     num_turns=iteration_num,
                 )
 
+            iteration_num += 1
+
     def _build_messages_suffix_ids(self, messages: list[dict[str, Any]]) -> list[int]:
         template_messages = [
             {"role": "user", "content": ""},
@@ -938,6 +940,7 @@ class AsyncRolloutWorker:
                     model_version=group.model_version,
                     metrics={
                         "reward": float(reward),
+                        "reward_mean": float(reward_mean),
                         "reward_std": reward_std,
                         **{
                             f"rewards/{name}": float(func_reward)
