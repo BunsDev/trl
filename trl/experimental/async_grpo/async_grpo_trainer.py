@@ -595,7 +595,8 @@ class AsyncGRPOTrainer(_BaseTrainer):
         # has already restored the model weights. The sequence is: start worker thread → wait for NCCL
         # init → sync weights to vLLM → begin generation. This ensures vLLM always uses the current
         # policy before producing any samples (matters for resumed runs, harmless for fresh ones).
-        self._sync_weight()
+        # XXX
+        # self._sync_weight()
         if self.accelerator.is_main_process and self.rollout_worker:
             self.rollout_worker.start()
         try:

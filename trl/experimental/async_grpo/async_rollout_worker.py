@@ -671,15 +671,18 @@ class AsyncRolloutWorker:
                 num_turns=iteration_num,
             )
 
-        # Dynamically clip max_tokens based on max_seq_length so that prompt + completion <= max_seq_length.
-        effective_max_tokens = (
-            min(self.max_completion_tokens, self.max_seq_length - len(prompt_ids))
-            if self.max_seq_length
-            else self.max_completion_tokens
-        )
+        # Dynamically clip max_tokens so that prompt + completion fits within both max_seq_length and
+        # max_model_len (the vLLM server's context window). Without this, vLLM rejects the request with a 400
+        # when len(prompt_ids) + max_tokens > max_model_len.
+        effective_max_tokens = self.max_completion_tokens
+        if self.max_seq_length:
+            effective_max_tokens = min(effective_max_tokens, self.max_seq_length - len(prompt_ids))
+        if self.max_model_len is not None:
+            effective_max_tokens = min(effective_max_tokens, self.max_model_len - len(prompt_ids))
         if effective_max_tokens <= 0:
             logger.warning(
-                f"Prompt length {len(prompt_ids)} >= max_seq_length {self.max_seq_length}. Skipping sample."
+                f"Prompt length {len(prompt_ids)} >= max allowed context "
+                f"(max_seq_length={self.max_seq_length}, max_model_len={self.max_model_len}). Skipping sample."
             )
             return RolloutCompletion(
                 completion=completion,
@@ -724,7 +727,6 @@ class AsyncRolloutWorker:
             prompt_ids = prompt_ids + turn_ids + tool_suffix_ids
             iteration_num += 1
 
-            # Re-check: can we still generate at least 1 token in the next turn?
             if self.max_model_len is not None and len(prompt_ids) >= self.max_model_len:
                 logger.warning(
                     f"Multi-turn prompt length {len(prompt_ids)} >= max_model_len {self.max_model_len}. "
@@ -741,15 +743,16 @@ class AsyncRolloutWorker:
                     num_turns=iteration_num,
                 )
 
-            effective_max_tokens = (
-                min(self.max_completion_tokens, self.max_seq_length - len(prompt_ids))
-                if self.max_seq_length
-                else self.max_completion_tokens
-            )
+            effective_max_tokens = self.max_completion_tokens
+            if self.max_seq_length:
+                effective_max_tokens = min(effective_max_tokens, self.max_seq_length - len(prompt_ids))
+            if self.max_model_len is not None:
+                effective_max_tokens = min(effective_max_tokens, self.max_model_len - len(prompt_ids))
 
             if effective_max_tokens <= 0:
                 logger.warning(
-                    f"Multi-turn prompt length {len(prompt_ids)} >= max_seq_length {self.max_seq_length}. "
+                    f"Multi-turn prompt length {len(prompt_ids)} >= max allowed context "
+                    f"(max_seq_length={self.max_seq_length}, max_model_len={self.max_model_len}). "
                     f"Stopping generation early."
                 )
                 return RolloutCompletion(
@@ -824,13 +827,23 @@ class AsyncRolloutWorker:
             try:
                 output = await self._post("/v1/completions", payload, self.request_timeout)
                 break
-            except (aiohttp.ServerDisconnectedError, aiohttp.ClientConnectionError, aiohttp.ClientResponseError):
-                # vLLM drops connections or returns 503 during weight sync (/pause). Wait briefly and retry.
+            except aiohttp.ClientResponseError as e:
+                # Only retry on 503 Service Unavailable (weight sync pause). Client errors like 400 are
+                # not transient — retrying them wastes time and pollutes logs.
+                if e.status < 500:
+                    raise
                 turn += 1
                 if turn >= max_generation_retry:
                     logger.error(f"Max retries ({max_generation_retry}) exceeded for vLLM generation. Reraising.")
                     raise
-                # vLLM drops connections or returns 503 during weight sync (/pause). Wait briefly and retry.
+                logger.debug(f"Server returned {e.status} (likely weight sync pause), retrying...")
+                await asyncio.sleep(1.0)
+            except (aiohttp.ServerDisconnectedError, aiohttp.ClientConnectionError):
+                # vLLM drops connections during weight sync (/pause). Wait briefly and retry.
+                turn += 1
+                if turn >= max_generation_retry:
+                    logger.error(f"Max retries ({max_generation_retry}) exceeded for vLLM generation. Reraising.")
+                    raise
                 logger.debug("Server unavailable (likely weight sync pause), retrying...")
                 await asyncio.sleep(1.0)
 
