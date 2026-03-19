@@ -108,7 +108,7 @@ class RolloutGroup:
     queued_at: float = 0.0
     raw_completions: list[RolloutCompletion] = field(default_factory=list)
 
-    def append_rollout(self, result: RolloutCompletion):
+    def append_completion(self, result: RolloutCompletion):
         self.completions.append(result.completion)
         self.completions_ids.append(result.completion_ids)
         self.completions_logprobs.append(result.completion_logprobs)
@@ -119,7 +119,8 @@ class RolloutGroup:
         self.tool_failure_counts.append(result.tool_failure_count)
         self.truncated.append(result.truncated)
         self.num_turns.append(result.num_turns)
-        self.completions.append(result)
+        # XXX(@aminediro): refacto where and how messages are stored
+        self.raw_completions.append(result)
 
 
 @dataclass(slots=True)
@@ -582,7 +583,7 @@ class AsyncRolloutWorker:
                         continue
 
                     group = pending_groups[group_id]
-                    group.append_rollout(result)
+                    group.append_completion(result)
                     self._total_completion_tokens += sum(result.tool_mask)
                     pending_completed[group_id] += 1
 
@@ -922,8 +923,8 @@ class AsyncRolloutWorker:
                 output = await self._post("/v1/completions", payload, self.request_timeout)
                 break
             except aiohttp.ClientResponseError as e:
-                # Only retry on 503 Service Unavailable (weight sync pause). Client errors like 400 are
-                # not transient — retrying them wastes time and pollutes logs.
+                # Only retry on 503 Service Unavailable (weight sync pause).
+                # Client errors like 400 are not transient,retrying them wastes time
                 if e.status < 500:
                     raise
                 turn += 1
