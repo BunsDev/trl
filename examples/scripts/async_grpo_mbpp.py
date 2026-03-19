@@ -18,7 +18,7 @@ CUDA_VISIBLE_DEVICES=2,3,4,5 VLLM_SERVER_DEV_MODE=1 vllm serve Qwen/Qwen3-4B \
     --weight-transfer-config '{"backend":"nccl"}' \
     --max-model-len 9216
 
-CUDA_VISIBLE_DEVICES=0,1 accelerate launch  --config_file examples/accelerate_configs/fsdp2.yaml  examples/scripts/async_grpo_mbpp.py
+CUDA_VISIBLE_DEVICES=0,1 accelerate launch --config_file examples/accelerate_configs/fsdp2.yaml  examples/scripts/async_grpo_mbpp.py
 
 !/! NOTE: depends on transformers > 5.0.0
 """
