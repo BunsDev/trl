@@ -607,6 +607,26 @@ def entropy_from_logits(logits: torch.Tensor, chunk_size: int = 128) -> torch.Te
     return entropies.reshape(original_shape)
 
 
+def _strip_images_from_messages(messages):
+    """
+    Return messages with PIL Image objects removed from VLM content blocks.
+
+    Replaces ``{"type": "image", "image": <PIL.Image>}`` with ``{"type": "image"}`` so that the message structure is
+    preserved but the non-serializable PIL object is dropped. Non-multimodal messages (string content) are returned
+    unchanged.
+    """
+    if not isinstance(messages, list):
+        return messages
+    result = []
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            content = [{"type": block["type"]} if block.get("type") == "image" else block for block in content]
+            msg = {**msg, "content": content}
+        result.append(msg)
+    return result
+
+
 def print_prompt_completions_sample(
     prompts: list,
     completions: list,
@@ -685,7 +705,17 @@ def print_prompt_completions_sample(
                         args_str = ", ".join(f"{k}={v!r}" for k, v in args.items())
                         t.append(f"{fn.get('name', '?')}({args_str})")
                 else:
-                    t.append(msg.get("content") or "")
+                    content = msg.get("content") or ""
+                    if isinstance(content, list):
+                        # VLM format: content is a list of typed blocks, e.g.
+                        # [{"type": "image", ...}, {"type": "text", "text": "..."}]
+                        for block in content:
+                            if block.get("type") == "text":
+                                t.append(block["text"])
+                            elif block.get("type") == "image":
+                                t.append("[IMAGE]", style="bold cyan")
+                    else:
+                        t.append(content)
                 if j < len(entry) - 1:
                     t.append("\n\n")
         else:

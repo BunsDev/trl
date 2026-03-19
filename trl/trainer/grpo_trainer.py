@@ -72,6 +72,7 @@ from .callbacks import SyncRefModelCallback
 from .grpo_config import GRPOConfig
 from .utils import (
     RepeatSampler,
+    _strip_images_from_messages,
     create_model_from_path,
     disable_dropout_in_model,
     entropy_from_logits,
@@ -2452,8 +2453,8 @@ class GRPOTrainer(_BaseTrainer):
 
             table = {
                 "step": [self.state.global_step] * len(self._logs["prompt"]),
-                "prompt": self._logs["prompt"],
-                "completion": self._logs["completion"],
+                "prompt": [_strip_images_from_messages(messages) for messages in self._logs["prompt"]],
+                "completion": [_strip_images_from_messages(messages) for messages in self._logs["completion"]],
                 **self._logs["rewards"],
                 **self._logs["extra"],
                 "advantage": self._logs["advantages"],
@@ -2475,11 +2476,7 @@ class GRPOTrainer(_BaseTrainer):
                     images = []
                     for image_list in self._logs["images"]:
                         images.append([logging_backend.Image(image) for image in image_list])
-                    df = pd.concat(
-                        [df_base, pd.Series(images, name="image")],
-                        axis=1,
-                        copy=False,
-                    )
+                    df = pd.concat([df_base, pd.Series(images, name="image")], axis=1, copy=False)
                 else:
                     df = df_base
 

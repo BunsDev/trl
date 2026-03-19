@@ -60,6 +60,7 @@ from .callbacks import SyncRefModelCallback
 from .rloo_config import RLOOConfig
 from .utils import (
     RepeatSampler,
+    _strip_images_from_messages,
     create_model_from_path,
     disable_dropout_in_model,
     entropy_from_logits,
@@ -1473,7 +1474,7 @@ class RLOOTrainer(_BaseTrainer):
 
             table = {
                 "step": [str(self.state.global_step)] * len(self._logs["prompt"]),
-                "prompt": self._logs["prompt"],
+                "prompt": [_strip_images_from_messages(p) for p in self._logs["prompt"]],
                 "completion": self._logs["completion"],
                 **self._logs["rewards"],
                 **self._logs["extra"],
