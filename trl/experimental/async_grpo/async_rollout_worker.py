@@ -20,7 +20,7 @@ import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, TypeAlias
 
 import aiohttp
@@ -48,8 +48,6 @@ Messages: TypeAlias = list[dict[str, str]]
 
 @dataclass(slots=True)
 class ToolCallRecord:
-    """Record of a single tool invocation within a turn."""
-
     tool_call_id: str | None
     name: str
     arguments: dict[str, Any]
@@ -108,6 +106,20 @@ class RolloutGroup:
     num_turns: list[int]
     model_version: int
     queued_at: float = 0.0
+    raw_completions: list[RolloutCompletion] = field(default_factory=list)
+
+    def append_rollout(self, result: RolloutCompletion):
+        self.completions.append(result.completion)
+        self.completions_ids.append(result.completion_ids)
+        self.completions_logprobs.append(result.completion_logprobs)
+        self.completions_turns.append(result.turns)
+        self.completions_total_durations.append(result.total_duration_s)
+        self.tool_mask.append(result.tool_mask)
+        self.tool_call_counts.append(result.tool_call_count)
+        self.tool_failure_counts.append(result.tool_failure_count)
+        self.truncated.append(result.truncated)
+        self.num_turns.append(result.num_turns)
+        self.completions.append(result)
 
 
 @dataclass(slots=True)
@@ -570,17 +582,7 @@ class AsyncRolloutWorker:
                         continue
 
                     group = pending_groups[group_id]
-                    group.completions.append(result.completion)
-                    group.completions_ids.append(result.completion_ids)
-                    group.completions_logprobs.append(result.completion_logprobs)
-                    group.completions_turns.append(result.turns)
-                    group.completions_total_durations.append(result.total_duration_s)
-                    group.tool_mask.append(result.tool_mask)
-                    group.tool_call_counts.append(result.tool_call_count)
-                    group.tool_failure_counts.append(result.tool_failure_count)
-                    group.truncated.append(result.truncated)
-                    group.num_turns.append(result.num_turns)
-                    # TODO: move this in generation task, shouldn't matter but is correct
+                    group.append_rollout(result)
                     self._total_completion_tokens += sum(result.tool_mask)
                     pending_completed[group_id] += 1
 
