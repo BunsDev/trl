@@ -752,7 +752,7 @@ class AsyncRolloutWorker:
         self, prompt: Messages, tool_dict: dict[str, Callable], is_done: Callable[[], bool] | None = None
     ) -> RolloutCompletion:
         turns: list[TurnRecord] = []
-        max_iterations = self.max_tool_calling_iterations
+        max_num_turns = self.max_tool_calling_iterations
         t_start = time.monotonic()
         prompt_ids = self.tokenizer.apply_chat_template(
             prompt,
@@ -804,7 +804,7 @@ class AsyncRolloutWorker:
             tool_calls_raw = assistant_message.get("tool_calls")
             turn.append_message(assistant_message)
 
-            if tool_calls_raw is None or (max_iterations is not None and iteration_num >= max_iterations):
+            if tool_calls_raw is None or (max_num_turns is not None and iteration_num >= max_num_turns):
                 turns.append(turn)
                 return _build_completion(turns, truncated=False, total_duration=time.monotonic() - t_start)
 
@@ -906,16 +906,16 @@ class AsyncRolloutWorker:
         return records, tool_messages
 
     async def _generate_one_turn(
-        self, prompt_ids: list[int], max_tokens: int | None = None, max_generation_retry: int = 10
+        self, prompt_ids: list[int], max_tokens: int, max_generation_retry: int = 10
     ) -> tuple[list[int], list[float]]:
         payload = {
             "model": self.model_name,
             "prompt": prompt_ids,
-            "max_tokens": max_tokens if max_tokens is not None else self.max_completion_tokens,
+            "max_tokens": max_tokens,
             "temperature": self.temperature,
             "n": 1,
             "return_token_ids": True,
-            "logprobs": 1,
+            "logprobs": 0,
         }
         turn = 0
         while turn < max_generation_retry:
