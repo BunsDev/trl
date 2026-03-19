@@ -385,7 +385,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
                     max_inflight_tasks=self.args.max_inflight_tasks,
                     queue_maxsize=self.args.queue_maxsize,
                     vllm_server_url=self.args.vllm_server_base_url,
-                    max_completion_tokens=self.args.max_completion_length,
+                    max_completion_length=self.args.max_completion_length,
                     max_seq_length=self.args.max_seq_length,
                     max_staleness=self.args.max_staleness,
                     temperature=self.args.temperature,
