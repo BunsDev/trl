@@ -152,7 +152,6 @@ def main() -> None:
         logging_steps=1,
         # trackio
         project="async_grpo_trl_mbpp",
-        trackio_space_id=None,
     )
 
     # 3. Trainer initialization
