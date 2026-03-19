@@ -183,7 +183,7 @@ class AsyncRolloutWorker:
         max_inflight_tasks: int = 128,
         queue_maxsize: int = 0,
         vllm_server_url: str = "http://localhost:8000",
-        max_completion_tokens: int = 1024,
+        max_completion_length: int = 1024,
         max_seq_length: int | None = None,
         max_staleness: int = 4,
         temperature: float = 1.0,
@@ -254,7 +254,7 @@ class AsyncRolloutWorker:
 
         self.vllm_server_url = vllm_server_url.rstrip("/")
         self.model_update_group = None
-        self.max_completion_tokens = max_completion_tokens
+        self.max_completion_length = max_completion_length
         self.max_seq_length = max_seq_length
         self.max_staleness = max_staleness
         self.temperature = temperature
@@ -736,8 +736,8 @@ class AsyncRolloutWorker:
         # Dynamically clip max_tokens so that prompt + completion fits within both max_seq_length and
         # max_model_len (the vLLM server's context window). Without this, vLLM rejects the request with a 400
         # when len(prompt_ids) + max_tokens > max_model_len.
-        effective_max_tokens = self.max_completion_tokens
-        if self.max_seq_length:
+        effective_max_tokens = self.max_completion_length
+        if self.max_seq_length is not None:
             effective_max_tokens = min(effective_max_tokens, self.max_seq_length - len(prompt_ids))
         if self.max_model_len is not None:
             effective_max_tokens = min(effective_max_tokens, self.max_model_len - len(prompt_ids))
@@ -805,7 +805,7 @@ class AsyncRolloutWorker:
                 )
                 return _build_completion(turns, truncated=True, total_duration=time.monotonic() - t_start)
 
-            effective_max_tokens = self.max_completion_tokens
+            effective_max_tokens = self.max_completion_length
             if self.max_seq_length:
                 effective_max_tokens = min(effective_max_tokens, self.max_seq_length - len(prompt_ids))
             if self.max_model_len is not None:
