@@ -157,7 +157,7 @@ def main() -> None:
     # 3. Trainer initialization
     trainer = AsyncGRPOTrainer(
         model="Qwen/Qwen3-4B",
-        args=config,
+        args=training_args,
         train_dataset=dataset,
         reward_funcs=[tests_passed_reward],
         environment_factory=MBPPEnvironment,
