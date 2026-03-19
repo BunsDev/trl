@@ -676,12 +676,18 @@ class TestPrintPromptCompletionsSample(TrlTestCase):
         ]
         completions = [
             [
-                {"role": "assistant", "tool_calls": [{"function": {"name": "get_temperature", "arguments": {"location": "Paris"}}}]},
+                {
+                    "role": "assistant",
+                    "tool_calls": [{"function": {"name": "get_temperature", "arguments": {"location": "Paris"}}}],
+                },
                 {"role": "tool", "content": "22 degrees"},
                 {"role": "assistant", "content": "The temperature in Paris is 22 degrees."},
             ],
             [
-                {"role": "assistant", "tool_calls": [{"function": {"name": "get_weather", "arguments": {"location": "London"}}}]},
+                {
+                    "role": "assistant",
+                    "tool_calls": [{"function": {"name": "get_weather", "arguments": {"location": "London"}}}],
+                },
                 {"role": "tool", "content": "Cloudy"},
                 {"role": "assistant", "content": "The weather in London is cloudy."},
             ],
