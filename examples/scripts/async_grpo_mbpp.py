@@ -137,7 +137,7 @@ def main() -> None:
     dataset = dataset.map(format_sample, remove_columns=dataset.column_names)
 
     # 2. Config setup
-    config = AsyncGRPOConfig(
+    training_args = AsyncGRPOConfig(
         output_dir="./results",
         per_device_train_batch_size=1,
         max_completion_length=8192,
