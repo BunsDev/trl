@@ -15,6 +15,7 @@
 import asyncio
 import hashlib
 import importlib.resources as pkg_resources
+import json
 import os
 import random
 import socket
@@ -673,18 +674,18 @@ def print_prompt_completions_sample(
         t = Text()
         if isinstance(entry, list) and all(isinstance(m, dict) for m in entry):
             for j, msg in enumerate(entry):
-                role = msg.get("role", "")
-                if "content" in msg:
-                    # Chat message
-                    t.append(f"{role.upper()}\n", style="bold red")
-                    t.append(msg["content"])
-                elif "name" in msg and "args" in msg:
-                    # Tool call
-                    t.append(f"{role.upper()}\n", style="bold red")
-                    t.append(f"{msg['name']}({msg['args']})")
+                t.append(f"{msg.get('role', '').upper()}\n", style="bold red")
+                if "tool_calls" in msg:
+                    if msg.get("content"):
+                        t.append(f"{msg['content']}\n")
+                    for tc in msg["tool_calls"]:
+                        fn = tc.get("function", {})
+                        raw = fn.get("arguments", {})
+                        args = raw if isinstance(raw, dict) else json.loads(raw)
+                        args_str = ", ".join(f"{k}={v!r}" for k, v in args.items())
+                        t.append(f"{fn.get('name', '?')}({args_str})")
                 else:
-                    # Fallback
-                    t.append(str(msg))
+                    t.append(msg.get("content") or "")
                 if j < len(entry) - 1:
                     t.append("\n\n")
         else:
