@@ -191,7 +191,11 @@ class TestDPOTrainer(TrlTestCase):
         # Workaround: hide kernels package so transformers doesn't unconditionally load mamba CUDA kernels.
         # See: https://github.com/huggingface/transformers/pull/44853
         kwargs = {}
-        ctx = patch("transformers.integrations.hub_kernels.lazy_load_kernel", return_value=None) if "NemotronH" in model_id else nullcontext()
+        ctx = (
+            patch("transformers.integrations.hub_kernels.lazy_load_kernel", return_value=None)
+            if "NemotronH" in model_id
+            else nullcontext()
+        )
         if "NemotronH" in model_id:
             kwargs["gradient_checkpointing"] = False
 
