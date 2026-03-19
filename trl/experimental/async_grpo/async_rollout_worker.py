@@ -18,6 +18,7 @@ import inspect
 import queue
 import threading
 import time
+from collections import defaultdict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any, TypeAlias
@@ -46,6 +47,49 @@ Messages: TypeAlias = list[dict[str, str]]
 
 
 @dataclass(slots=True)
+class ToolCallRecord:
+    """Record of a single tool invocation within a turn."""
+
+    tool_call_id: str | None
+    name: str
+    arguments: dict[str, Any]
+    result: str
+    failed: bool
+    duration: float  # wall-clock seconds for this tool call
+
+
+@dataclass(slots=True)
+class TurnRecord:
+    messages: Messages  # all messages this turn in role order: [context..., assistant, tool_result...]
+    generation_ids: list[int]  # token ids for the assistant response only
+    generation_logprobs: list[float]
+    generation_duration: float  # wall-clock seconds for the vLLM call
+
+    tool_calls: list[ToolCallRecord]  # per-call records with timing (empty if no tool calls)
+    tool_response_ids: list[int]  # token ids for the tool-result suffix (empty if no tool calls)
+    tool_execution_duration_s: float  # total wall-clock seconds for all tool calls in this turn
+
+    def append_message(self, message: dict[str, Any]) -> None:
+        self.messages.append(message)
+
+
+@dataclass(slots=True)
+class RolloutCompletion:
+    """Result of a single (possibly multi-turn) generation for one prompt."""
+
+    turns: list[TurnRecord]
+    completion: Messages
+    completion_ids: list[int]
+    completion_logprobs: list[float]
+    tool_mask: list[int]
+    tool_call_count: int
+    tool_failure_count: int
+    truncated: bool
+    num_turns: int
+    total_duration_s: float
+
+
+@dataclass(slots=True)
 class RolloutGroup:
     """Single GRPO group for one prompt with multiple completions."""
 
@@ -55,6 +99,8 @@ class RolloutGroup:
     completions: list[Messages]
     completions_ids: list[list[int]]
     completions_logprobs: list[list[float]]
+    completions_turns: list[list[TurnRecord]]
+    completions_total_durations: list[float]
     tool_mask: list[list[int]]
     tool_call_counts: list[int]
     tool_failure_counts: list[int]
@@ -76,18 +122,58 @@ class RolloutSample:
     metrics: dict[str, float]  # logging metadata only, not used in loss computation
 
 
-@dataclass(slots=True)
-class RolloutCompletion:
-    """Result of a single multi-turn generation for one prompt."""
+def _build_completion(turns: list[TurnRecord], truncated: bool, total_duration: float) -> RolloutCompletion:
+    """Derive a RolloutCompletion from a list of TurnRecords."""
+    completion: Messages = []
+    completion_ids: list[int] = []
+    completion_logprobs: list[float] = []
+    tool_mask: list[int] = []
+    tool_call_count = 0
+    tool_failure_count = 0
+    for turn in turns:
+        n_generated = 1 + len(turn.tool_calls)  # assistant + tool results
+        completion.extend(turn.messages[-n_generated:])
 
-    completion: Messages
-    completion_ids: list[int]
-    completion_logprobs: list[float]
-    tool_mask: list[int]
-    tool_call_count: int
-    tool_failure_count: int
-    truncated: bool
-    num_turns: int
+        completion_ids.extend(turn.generation_ids)
+        completion_logprobs.extend(turn.generation_logprobs)
+        tool_mask.extend([1] * len(turn.generation_ids))
+
+        completion_ids.extend(turn.tool_response_ids)
+        completion_logprobs.extend([0.0] * len(turn.tool_response_ids))
+        tool_mask.extend([0] * len(turn.tool_response_ids))
+
+        tool_call_count += len(turn.tool_calls)
+        tool_failure_count += sum(1 for tc in turn.tool_calls if tc.failed)
+
+    return RolloutCompletion(
+        turns=turns,
+        completion=completion,
+        completion_ids=completion_ids,
+        completion_logprobs=completion_logprobs,
+        tool_mask=tool_mask,
+        tool_call_count=tool_call_count,
+        tool_failure_count=tool_failure_count,
+        truncated=truncated,
+        num_turns=len(turns),
+        total_duration_s=total_duration,
+    )
+
+
+def _extract_tool_metrics(turns: list[TurnRecord]) -> dict[str, float]:
+    """Extract per-tool-name duration and failure metrics from a trajectory."""
+    durations: dict[str, list[float]] = defaultdict(list)
+    failures: dict[str, int] = defaultdict(int)
+    for turn in turns:
+        for tc in turn.tool_calls:
+            durations[tc.name].append(tc.duration)
+            if tc.failed:
+                failures[tc.name] += 1
+    metrics: dict[str, float] = {}
+    for name, durs in durations.items():
+        metrics[f"rollout/tool_duration_total/{name}"] = sum(durs)
+        metrics[f"rollout/tool_duration_mean/{name}"] = sum(durs) / len(durs)
+        metrics[f"rollout/tool_failures/{name}"] = float(failures[name])
+    return metrics
 
 
 class AsyncRolloutWorker:
@@ -410,6 +496,8 @@ class AsyncRolloutWorker:
                             completions=[],
                             completions_ids=[],
                             completions_logprobs=[],
+                            completions_turns=[],
+                            completions_total_durations=[],
                             tool_mask=[],
                             tool_call_counts=[],
                             tool_failure_counts=[],
@@ -485,6 +573,8 @@ class AsyncRolloutWorker:
                     group.completions.append(result.completion)
                     group.completions_ids.append(result.completion_ids)
                     group.completions_logprobs.append(result.completion_logprobs)
+                    group.completions_turns.append(result.turns)
+                    group.completions_total_durations.append(result.total_duration_s)
                     group.tool_mask.append(result.tool_mask)
                     group.tool_call_counts.append(result.tool_call_count)
                     group.tool_failure_counts.append(result.tool_failure_count)
@@ -658,11 +748,9 @@ class AsyncRolloutWorker:
     async def _generate_one(
         self, prompt: Messages, tool_dict: dict[str, Callable], is_done: Callable[[], bool] | None = None
     ) -> RolloutCompletion:
-        completion, completion_ids, completion_logprobs, tool_mask = [], [], [], []
-        tool_call_count = 0
-        tool_failure_count = 0
-        iteration_num = 0
+        turns: list[TurnRecord] = []
         max_iterations = self.max_tool_calling_iterations
+        t_start = time.monotonic()
         prompt_ids = self.tokenizer.apply_chat_template(
             prompt,
             return_dict=False,
@@ -674,16 +762,7 @@ class AsyncRolloutWorker:
 
         if self.max_model_len is not None and len(prompt_ids) >= self.max_model_len:
             logger.warning(f"Prompt length {len(prompt_ids)} >= max_model_len {self.max_model_len}. Skipping sample.")
-            return RolloutCompletion(
-                completion=completion,
-                completion_ids=completion_ids,
-                completion_logprobs=completion_logprobs,
-                tool_mask=tool_mask,
-                tool_call_count=tool_call_count,
-                tool_failure_count=tool_failure_count,
-                truncated=True,
-                num_turns=iteration_num,
-            )
+            return _build_completion(turns, truncated=True, total_duration=time.monotonic() - t_start)
 
         # Dynamically clip max_tokens so that prompt + completion fits within both max_seq_length and
         # max_model_len (the vLLM server's context window). Without this, vLLM rejects the request with a 400
@@ -698,45 +777,47 @@ class AsyncRolloutWorker:
                 f"Prompt length {len(prompt_ids)} >= max allowed context "
                 f"(max_seq_length={self.max_seq_length}, max_model_len={self.max_model_len}). Skipping sample."
             )
-            return RolloutCompletion(
-                completion=completion,
-                completion_ids=completion_ids,
-                completion_logprobs=completion_logprobs,
-                tool_mask=tool_mask,
-                tool_call_count=tool_call_count,
-                tool_failure_count=tool_failure_count,
-                truncated=True,
-                num_turns=iteration_num,
+            return _build_completion(turns, truncated=True, total_duration=time.monotonic() - t_start)
+
+        iteration_num = 0
+        # context_messages for the current turn: initial prompt for turn 0, tool results for turn N>0
+        context_messages: Messages = list(prompt)
+        while True:
+            t_gen = time.monotonic()
+            turn_ids, turn_logprobs = await self._generate_one_turn(prompt_ids, max_tokens=effective_max_tokens)
+            generation_duration = time.monotonic() - t_gen
+
+            turn = TurnRecord(
+                messages=list(context_messages),
+                generation_ids=turn_ids,
+                generation_logprobs=turn_logprobs,
+                generation_duration=generation_duration,
+                tool_calls=[],
+                tool_response_ids=[],
+                tool_execution_duration_s=0.0,
             )
 
-        while True:
-            turn_ids, turn_logprobs = await self._generate_one_turn(prompt_ids, max_tokens=effective_max_tokens)
             assistant_message = parse_response(self.tokenizer, turn_ids)
-            completion.append(assistant_message)
-            completion_ids.extend(turn_ids)
-            completion_logprobs.extend(turn_logprobs)
-            tool_mask.extend([1] * len(turn_ids))
-            tool_calls = assistant_message.get("tool_calls")
-            if tool_calls is None or (max_iterations is not None and iteration_num >= max_iterations):
-                return RolloutCompletion(
-                    completion=completion,
-                    completion_ids=completion_ids,
-                    completion_logprobs=completion_logprobs,
-                    tool_mask=tool_mask,
-                    tool_call_count=tool_call_count,
-                    tool_failure_count=tool_failure_count,
-                    truncated=False,
-                    num_turns=iteration_num,
-                )
+            tool_calls_raw = assistant_message.get("tool_calls")
+            turn.append_message(assistant_message)
 
-            tool_messages, n_calls, n_failures = self._execute_tool_calls(tool_calls, tool_dict)
-            tool_call_count += n_calls
-            tool_failure_count += n_failures
-            completion.extend(tool_messages)
+            if tool_calls_raw is None or (max_iterations is not None and iteration_num >= max_iterations):
+                turns.append(turn)
+                return _build_completion(turns, truncated=False, total_duration=time.monotonic() - t_start)
+
+            t_tools = time.monotonic()
+            tool_call_records, tool_messages = self._execute_tool_calls(tool_calls_raw, tool_dict)
+            tool_execution_duration = time.monotonic() - t_tools
+
             tool_suffix_ids = self._build_messages_suffix_ids(tool_messages)
-            completion_ids.extend(tool_suffix_ids)
-            completion_logprobs.extend([0.0] * len(tool_suffix_ids))
-            tool_mask.extend([0] * len(tool_suffix_ids))
+            for tool_message in tool_messages:
+                turn.append_message(tool_message)
+            turn.tool_calls = tool_call_records
+            turn.tool_response_ids = tool_suffix_ids
+            turn.tool_execution_duration_s = tool_execution_duration
+            turns.append(turn)
+            context_messages = list(tool_messages)
+
             prompt_ids = prompt_ids + turn_ids + tool_suffix_ids
 
             if self.max_model_len is not None and len(prompt_ids) >= self.max_model_len:
@@ -744,16 +825,7 @@ class AsyncRolloutWorker:
                     f"Multi-turn prompt length {len(prompt_ids)} >= max_model_len {self.max_model_len}. "
                     f"Stopping generation early."
                 )
-                return RolloutCompletion(
-                    completion=completion,
-                    completion_ids=completion_ids,
-                    completion_logprobs=completion_logprobs,
-                    tool_mask=tool_mask,
-                    tool_call_count=tool_call_count,
-                    tool_failure_count=tool_failure_count,
-                    truncated=True,
-                    num_turns=iteration_num,
-                )
+                return _build_completion(turns, truncated=True, total_duration=time.monotonic() - t_start)
 
             effective_max_tokens = self.max_completion_tokens
             if self.max_seq_length:
@@ -767,28 +839,10 @@ class AsyncRolloutWorker:
                     f"(max_seq_length={self.max_seq_length}, max_model_len={self.max_model_len}). "
                     f"Stopping generation early."
                 )
-                return RolloutCompletion(
-                    completion=completion,
-                    completion_ids=completion_ids,
-                    completion_logprobs=completion_logprobs,
-                    tool_mask=tool_mask,
-                    tool_call_count=tool_call_count,
-                    tool_failure_count=tool_failure_count,
-                    truncated=True,
-                    num_turns=iteration_num,
-                )
+                return _build_completion(turns, truncated=True, total_duration=time.monotonic() - t_start)
 
             if is_done is not None and is_done():
-                return RolloutCompletion(
-                    completion=completion,
-                    completion_ids=completion_ids,
-                    completion_logprobs=completion_logprobs,
-                    tool_mask=tool_mask,
-                    tool_call_count=tool_call_count,
-                    tool_failure_count=tool_failure_count,
-                    truncated=False,
-                    num_turns=iteration_num,
-                )
+                return _build_completion(turns, truncated=False, total_duration=time.monotonic() - t_start)
 
             iteration_num += 1
 
@@ -819,22 +873,34 @@ class AsyncRolloutWorker:
 
     def _execute_tool_calls(
         self, tool_calls: list[dict[str, Any]], tool_dict: dict[str, Callable]
-    ) -> tuple[list[dict[str, str]], int, int]:
-        tool_messages = []
-        n_calls = 0
-        n_failures = 0
+    ) -> tuple[list[ToolCallRecord], list[dict[str, str]]]:
+        records: list[ToolCallRecord] = []
+        tool_messages: list[dict[str, str]] = []
         for tool_call in tool_calls:
-            n_calls += 1
             function = tool_call["function"]
             name = function["name"]
+            arguments = function.get("arguments", {})
+            tool_call_id = tool_call.get("id")
+            t_tool = time.monotonic()
+            failed = False
             try:
-                arguments = function.get("arguments", {})
                 result = tool_dict[name](**arguments)
             except Exception as error:
-                n_failures += 1
+                failed = True
                 result = {"error": str(error)}
+            duration = time.monotonic() - t_tool
+            records.append(
+                ToolCallRecord(
+                    tool_call_id=tool_call_id,
+                    name=name,
+                    arguments=arguments,
+                    result=str(result),
+                    failed=failed,
+                    duration=duration,
+                )
+            )
             tool_messages.append({"role": "tool", "name": name, "content": str(result)})
-        return tool_messages, n_calls, n_failures
+        return records, tool_messages
 
     async def _generate_one_turn(
         self, prompt_ids: list[int], max_tokens: int | None = None, max_generation_retry: int = 10
@@ -928,6 +994,8 @@ class AsyncRolloutWorker:
             completion,
             completion_ids,
             logprobs,
+            turns,
+            total_duration,
             tool_mask,
             advantage,
             reward,
@@ -939,6 +1007,8 @@ class AsyncRolloutWorker:
                 group.completions,
                 group.completions_ids,
                 group.completions_logprobs,
+                group.completions_turns,
+                group.completions_total_durations,
                 group.tool_mask,
                 advantages,
                 rewards,
@@ -952,6 +1022,10 @@ class AsyncRolloutWorker:
             if self.max_seq_length is not None and seq_len > self.max_seq_length:
                 logger.warning(f"Dropping overlong sample (seq_len={seq_len}, max_seq_length={self.max_seq_length})")
                 continue
+
+            traj_metrics = _extract_tool_metrics(turns)
+            traj_metrics["rollout/total_duration"] = total_duration
+            traj_metrics["rollout/total_generation_duration"] = sum(turn.generation_duration for turn in turns)
 
             samples.append(
                 RolloutSample(
@@ -972,6 +1046,7 @@ class AsyncRolloutWorker:
                             for name, func_reward in zip(self.reward_func_names, per_func_rewards[:, i], strict=True)
                         },
                         **tm,
+                        **traj_metrics,
                         "rollout/truncated": float(truncated),
                         "rollout/num_turns": float(num_turns),
                     },
