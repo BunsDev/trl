@@ -973,7 +973,7 @@ class AsyncRolloutWorker:
         per_func_rewards = np.array(all_rewards, dtype=float)  # shape (num_funcs, num_completions)
 
         samples = []
-        for i, (c, advantage, reward, tm) in enumerate(
+        for i, (c, advantage, reward, completion_tool_metrics) in enumerate(
             zip(group.completions, advantages, rewards, tool_metrics, strict=True)
         ):
             completion_ids = c.get_completion_ids()
@@ -982,9 +982,12 @@ class AsyncRolloutWorker:
                 logger.warning(f"Dropping overlong sample (seq_len={seq_len}, max_seq_length={self.max_seq_length})")
                 continue
 
+            # Trajectory metrics
             traj_metrics = _extract_tool_metrics(c.turns)
             traj_metrics["rollout/total_duration_s"] = c.total_duration_s
             traj_metrics["rollout/turn_generation_duration_s"] = sum(t.generation_duration for t in c.turns)
+            traj_metrics["rollout/truncated"] = float(c.truncated)
+            traj_metrics["rollout/num_turns"] = float(len(c.turns))
 
             samples.append(
                 RolloutSample(
@@ -996,18 +999,16 @@ class AsyncRolloutWorker:
                     advantage=advantage,
                     model_version=group.model_version,
                     metrics={
+                        "advantage": advantage,
                         "reward": float(reward),
                         "reward_mean": float(reward_mean),
                         "reward_std": reward_std,
-                        "advantage": advantage,
                         **{
                             f"rewards/{name}": float(func_reward)
                             for name, func_reward in zip(self.reward_func_names, per_func_rewards[:, i], strict=True)
                         },
-                        **tm,
+                        **completion_tool_metrics,
                         **traj_metrics,
-                        "rollout/truncated": float(c.truncated),
-                        "rollout/num_turns": float(len(c.turns)),
                     },
                 )
             )
