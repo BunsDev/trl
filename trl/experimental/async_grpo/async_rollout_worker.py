@@ -27,6 +27,7 @@ import requests
 from accelerate.logging import get_logger
 from datasets import Dataset
 from transformers import AutoTokenizer
+from transformers.utils import get_json_schema
 
 from trl.chat_template_utils import add_response_schema, get_training_chat_template, parse_response
 from trl.import_utils import is_vllm_available
@@ -199,6 +200,7 @@ class AsyncRolloutWorker:
         self.num_generations = num_generations
         self.max_inflight_tasks = max_inflight_tasks
         self.environments = None
+        self._is_done_methods = [None] * self.max_inflight_tasks
         environment_methods = [[] for _ in range(self.max_inflight_tasks)]
         if environment_factory is not None:
             self.environments = [environment_factory() for _ in range(self.max_inflight_tasks)]
@@ -207,6 +209,8 @@ class AsyncRolloutWorker:
                 for name, member in inspect.getmembers(environment, predicate=inspect.ismethod):
                     if name == "reset":
                         has_reset = True
+                    elif name == "is_done":
+                        self._is_done_methods[i] = member
                     elif not name.startswith("_"):
                         environment_methods[i].append(member)
                 if not has_reset:
@@ -221,7 +225,10 @@ class AsyncRolloutWorker:
                 if inspect.iscoroutinefunction(tool):
                     raise ValueError("Asynchronous tools are not supported in AsyncRolloutWorker yet.")
                 self._sync_tool_dicts[i][tool.__name__] = tool
-        self.tools = base_tools + (environment_methods[0] if self.environments is not None else [])
+        self.tools = base_tools + (
+            # Pre-convert any bound methods to JSON schema dicts so they pass transformers' `isfunction` check.
+            [get_json_schema(t) for t in environment_methods[0]] if self.environments is not None else []
+        )
 
         self.vllm_server_url = vllm_server_url.rstrip("/")
         self.model_update_group = None
@@ -416,7 +423,11 @@ class AsyncRolloutWorker:
 
                     logger.info(f"[slot] assigned slot={slot} group={group_id} free_after={len(free_slots)}")
                     task = asyncio.create_task(
-                        self._generate_one(pending_groups[group_id].prompt, tool_dict=self._sync_tool_dicts[slot])
+                        self._generate_one(
+                            pending_groups[group_id].prompt,
+                            tool_dict=self._sync_tool_dicts[slot],
+                            is_done=self._is_done_methods[slot],
+                        )
                     )
                     inflight_tasks[task] = (group_id, slot)
 
@@ -561,7 +572,7 @@ class AsyncRolloutWorker:
             group_id += 1
 
     async def _generate_one(
-        self, prompt: Messages, tool_dict: dict[str, Callable]
+        self, prompt: Messages, tool_dict: dict[str, Callable], is_done: Callable[[], bool] | None = None
     ) -> RolloutCompletion:
         turns: list[TurnRecord] = []
         max_num_turns = self.max_tool_calling_iterations
@@ -624,6 +635,9 @@ class AsyncRolloutWorker:
             context_messages = list(tool_messages)
 
             prompt_ids = prompt_ids + turn_ids + tool_suffix_ids
+
+            if is_done is not None and is_done():
+                return _build_completion(turns, truncated=False, total_duration=time.monotonic() - t_start)
 
             iteration_num += 1
 
