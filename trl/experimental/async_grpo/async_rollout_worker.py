@@ -113,7 +113,6 @@ class RolloutCompletion:
         return [tm for turn in self.turns for tm in turn.messages]
 
 
-
 @dataclass(slots=True)
 class RolloutGroup:
     """Single GRPO group for one prompt with multiple completions."""
@@ -127,6 +126,7 @@ class RolloutGroup:
 
     def append_completion(self, result: RolloutCompletion):
         self.completions.append(result)
+
 
 def _build_completion(turns: list[TurnRecord], truncated: bool, total_duration: float) -> RolloutCompletion:
     """Derive a RolloutCompletion from a list of TurnRecords."""
