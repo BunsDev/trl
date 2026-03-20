@@ -1392,6 +1392,7 @@ class GRPOTrainer(_BaseTrainer):
         prefix_ids = self.processing_class.apply_chat_template(
             dummy_messages,
             add_generation_prompt=False,
+            tokenize=True,
             chat_template=self.chat_template,
             return_dict=False,
             **self.chat_template_kwargs,
@@ -1399,10 +1400,16 @@ class GRPOTrainer(_BaseTrainer):
         full_ids = self.processing_class.apply_chat_template(
             dummy_messages + tool_messages,
             add_generation_prompt=True,
+            tokenize=True,
             chat_template=self.chat_template,
             return_dict=False,
             **self.chat_template_kwargs,
         )
+        # VLM processors return batched output (list of lists), unbatch for single conversation
+        if isinstance(prefix_ids, list) and len(prefix_ids) == 1 and isinstance(prefix_ids[0], list):
+            prefix_ids = prefix_ids[0]
+        if isinstance(full_ids, list) and len(full_ids) == 1 and isinstance(full_ids[0], list):
+            full_ids = full_ids[0]
         if not full_ids[: len(prefix_ids)] == prefix_ids:
             raise ValueError("Unexpected tokenization: the prefix IDs are not a prefix of the full IDs.")
         return full_ids[len(prefix_ids) :]
@@ -1499,7 +1506,11 @@ class GRPOTrainer(_BaseTrainer):
             if self.use_vllm and self.vllm_mode == "colocate":
                 max_model_len = self.vllm_generation.llm.llm_engine.model_config.max_model_len
             elif not self.use_vllm:
-                max_model_len = self.model.config.max_position_embeddings
+                max_model_len = getattr(self.model.config, "max_position_embeddings", None)
+                if max_model_len is None:
+                    # Some models (e.g., Qwen3.5) store max length in text_config or use a different attribute
+                    text_config = getattr(self.model.config, "text_config", self.model.config)
+                    max_model_len = getattr(text_config, "max_position_embeddings", 32768)
             else:
                 raise NotImplementedError(
                     f"Unsupported mode detected: use_vllm={self.use_vllm}, vllm_mode={self.vllm_mode}"
@@ -1569,9 +1580,12 @@ class GRPOTrainer(_BaseTrainer):
                 pct = prompt_completion_tool_ids[idx]  # = prompt-completion-tool
                 completion_ids[idx_with_tool] = pct[prompt_length:] + post_tool_ids[idx]
 
-            # Decode post-tool completions
+            # Decode post-tool completions. Use tokenizer for parsing (processors don't have parse_response).
+            parsing_class = self.processing_class
+            if not isinstance(parsing_class, PreTrainedTokenizerBase) and hasattr(parsing_class, "tokenizer"):
+                parsing_class = parsing_class.tokenizer
             post_tool_completions = [
-                parse_response(self.processing_class, ids) if ids else {} for ids in post_tool_ids
+                parse_response(parsing_class, ids) if ids else {} for ids in post_tool_ids
             ]
 
             # Add post-tool completions to the existing completions
@@ -1618,14 +1632,21 @@ class GRPOTrainer(_BaseTrainer):
             extra_fields = {}
 
         # Decode completions. It's important to use `parse_response` when possible, because it handles tool calls.
+        # For VLM processors, delegate to the inner tokenizer for parsing (parse_response lives on the tokenizer).
         if is_conversational({"prompt": prompts[0]}):
+            parsing_class = self.processing_class
+            if not isinstance(parsing_class, PreTrainedTokenizerBase) and hasattr(parsing_class, "tokenizer"):
+                # Propagate response_schema from processor to tokenizer if needed
+                if getattr(self.processing_class, "response_schema", None) and not getattr(parsing_class.tokenizer, "response_schema", None):
+                    parsing_class.tokenizer.response_schema = self.processing_class.response_schema
+                parsing_class = parsing_class.tokenizer
             if (
                 Version(transformers.__version__) >= Version("5.0.0")  # parse_response added in v5
-                and isinstance(self.processing_class, PreTrainedTokenizerBase)  # doesn't work with processors
-                and hasattr(self.processing_class, "response_schema")  # attribute not set by default for now
-                and self.processing_class.response_schema is not None  # only works if the tokenizer has a schema
+                and isinstance(parsing_class, PreTrainedTokenizerBase)
+                and hasattr(parsing_class, "response_schema")  # attribute not set by default for now
+                and parsing_class.response_schema is not None  # only works if the tokenizer has a schema
             ):
-                completions = [[parse_response(self.processing_class, ids)] for ids in completion_ids]
+                completions = [[parse_response(parsing_class, ids)] for ids in completion_ids]
             else:
                 contents = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
                 completions = [[{"role": "assistant", "content": content}] for content in contents]
