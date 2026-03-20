@@ -495,7 +495,6 @@ class AsyncRolloutWorker:
             except asyncio.QueueFull:
                 pass
 
-
     def _cancel_stale_tasks(
         self,
         version_heap: list[tuple[int, int]],
@@ -857,19 +856,19 @@ class AsyncRolloutWorker:
                     completion=completion,
                     input_ids=group.prompt_ids + completion_ids,
                     completion_mask=[0] * len(group.prompt_ids) + tool_mask,
-                old_log_probs=[0.0] * len(group.prompt_ids) + logprobs,
-                advantage=advantage,
-                model_version=group.model_version,
-                metrics={
-                    "reward": float(reward),
-                    "reward_std": reward_std,
-                    **{
-                        f"rewards/{name}": float(func_reward)
-                        for name, func_reward in zip(self.reward_func_names, per_func_rewards[:, i], strict=True)
+                    old_log_probs=[0.0] * len(group.prompt_ids) + logprobs,
+                    advantage=advantage,
+                    model_version=group.model_version,
+                    metrics={
+                        "reward": float(reward),
+                        "reward_std": reward_std,
+                        **{
+                            f"rewards/{name}": float(func_reward)
+                            for name, func_reward in zip(self.reward_func_names, per_func_rewards[:, i], strict=True)
+                        },
+                        **tm,
                     },
-                    **tm,
-                },
-            )
+                )
             )
         return samples
 
