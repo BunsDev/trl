@@ -1241,6 +1241,15 @@ class GRPOTrainer(_BaseTrainer):
     def _tokenize_prompts(self, prompts: list):
         """Tokenize prompts and extract images/multimodal fields for generation."""
         if is_conversational({"prompt": prompts[0]}):
+            # When the processor is a VLM processor, normalize string content to content blocks.
+            # Some VLM processors (e.g., Qwen3.5, Qwen3-VL) iterate over message["content"]
+            # assuming it's always a list of content blocks, which fails when content is a plain string.
+            if hasattr(self.processing_class, "image_processor"):
+                for prompt in prompts:
+                    for message in prompt:
+                        if isinstance(message["content"], str):
+                            message["content"] = [{"type": "text", "text": message["content"]}]
+
             # Extract images from messages for VLM support
             images = []
             has_images = False
@@ -1249,7 +1258,7 @@ class GRPOTrainer(_BaseTrainer):
                 for message in prompt:
                     if isinstance(message["content"], list):
                         for part in message["content"]:
-                            if part["type"] == "image":
+                            if isinstance(part, dict) and part.get("type") == "image":
                                 prompt_images.append(part["image"])
                                 has_images = True
                 images.append(prompt_images if prompt_images else None)
@@ -1445,7 +1454,11 @@ class GRPOTrainer(_BaseTrainer):
                             tool_call_results.append((name, result))
 
                 for name, result in tool_call_results:
-                    tool_message = {"role": "tool", "name": name, "content": str(result)}
+                    # Support multimodal tool responses: if the tool returns a list of content blocks
+                    # (e.g., [{"type": "image", "image": ...}, {"type": "text", "text": "..."}]),
+                    # pass them through directly so _tokenize_prompts can extract images for VLMs.
+                    content = result if isinstance(result, list) else str(result)
+                    tool_message = {"role": "tool", "name": name, "content": content}
                     prompt_completion_tool.append(tool_message)
                     completions[idx_with_tool].append(tool_message)
 
@@ -1775,7 +1788,26 @@ class GRPOTrainer(_BaseTrainer):
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
         batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
 
-        num_images = [len(img_list) for img_list in images] if images is not None else None
+        # For VLMs with tools, re-extract all images from the full conversation. After the tool loop,
+        # prompts contain both dataset images (from prepare_multimodal_messages) and tool response
+        # images (from multimodal tool returns in _tool_call_loop). We need all of them for the
+        # forward pass to compute pixel_values correctly.
+        if self.tools and hasattr(self.processing_class, "image_processor"):
+            all_images = []
+            has_images = False
+            for prompt in prompts:
+                sample_images = []
+                for message in prompt:
+                    if isinstance(message.get("content"), list):
+                        for part in message["content"]:
+                            if isinstance(part, dict) and part.get("type") == "image":
+                                sample_images.append(part["image"])
+                                has_images = True
+                all_images.append(sample_images if sample_images else None)
+            if has_images:
+                images = all_images
+
+        num_images = [len(img_list) if img_list else 0 for img_list in images] if images is not None else None
 
         # Get forward_kwargs for models with multimodal inputs
         if images is not None:
