@@ -65,7 +65,7 @@ def parse_args():
         help="URLs for CARLA environment servers. At least 2 required (1 Space = 1 connection).",
     )
     parser.add_argument("--dataset-size", type=int, default=1000)
-    parser.add_argument("--max-completion-length", type=int, default=1024)
+    parser.add_argument("--max-completion-length", type=int, default=2048)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=16)
     parser.add_argument("--max-steps", type=int, default=50)
     parser.add_argument("--image-size", type=int, default=512, help="Resize camera images to this size. 0 to disable.")
