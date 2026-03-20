@@ -17,6 +17,7 @@ import inspect
 import queue
 import threading
 import time
+from collections import defaultdict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any, TypeAlias
@@ -130,6 +131,23 @@ class RolloutGroup:
 def _build_completion(turns: list[TurnRecord], truncated: bool, total_duration: float) -> RolloutCompletion:
     """Derive a RolloutCompletion from a list of TurnRecords."""
     return RolloutCompletion(turns=turns, truncated=truncated, total_duration_s=total_duration)
+
+
+def _extract_tool_metrics(turns: list[TurnRecord]) -> dict[str, float]:
+    """Extract per-tool-name duration and failure metrics from a trajectory."""
+    durations: dict[str, list[float]] = defaultdict(list)
+    failures: dict[str, int] = defaultdict(int)
+    for turn in turns:
+        for tc in turn.tool_calls:
+            durations[tc.name].append(tc.duration)
+            if tc.failed:
+                failures[tc.name] += 1
+    metrics: dict[str, float] = {}
+    for name, durs in durations.items():
+        metrics[f"rollout/tool_duration_total/{name}"] = sum(durs)
+        metrics[f"rollout/tool_duration_mean/{name}"] = sum(durs) / len(durs)
+        metrics[f"rollout/tool_failures/{name}"] = float(failures[name])
+    return metrics
 
 
 @dataclass(slots=True)
@@ -493,6 +511,26 @@ class AsyncRolloutWorker:
             f"wait_scoring={wait_scoring_ms:.1f}ms"
         )
 
+    def _compute_rollout_metrics(self, samples: list[RolloutSample], scoring_time: float, wait_scoring: float) -> None:
+        assert self._generation_start_time is not None, "generation_start_time init in run()"
+        elapsed = time.monotonic() - self._generation_start_time
+        generation_tok_per_sec = self._total_completion_tokens / elapsed if elapsed > 0 else 0.0
+
+        scoring_time_ms = scoring_time * 1000
+        wait_scoring_ms = wait_scoring * 1000
+
+        for sample in samples:
+            sample.metrics["generation_tok_per_s"] = generation_tok_per_sec
+            sample.metrics["scoring_time_ms"] = scoring_time_ms
+            sample.metrics["wait_scoring_ms"] = wait_scoring_ms
+            sample.metrics["buffer_qsize"] = self.rollout_buffer.qsize()
+
+        logger.info(
+            f"[inference] total_completion_tokens={self._total_completion_tokens}, "
+            f"generation_tok/s={generation_tok_per_sec:.1f}, scoring_time={scoring_time_ms:.1f}ms, "
+            f"wait_scoring={wait_scoring_ms:.1f}ms"
+        )
+
     async def _score_loop(self, stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():
             t_wait = time.monotonic()
@@ -512,6 +550,7 @@ class AsyncRolloutWorker:
             t0 = time.monotonic()
             samples = await self._score_group(group)
             scoring_time = time.monotonic() - t0
+            self._compute_rollout_metrics(samples, scoring_time, wait_scoring)
             logger.info(
                 f"[score] scored {len(samples)} samples in {scoring_time:.2f}s, "
                 f"buffer_qsize={self.rollout_buffer.qsize()}"
@@ -757,35 +796,43 @@ class AsyncRolloutWorker:
 
         per_func_rewards = np.array(all_rewards, dtype=float)  # shape (num_funcs, num_completions)
 
-        return [
-            RolloutSample(
-                prompt=group.prompt,
-                completion=c.get_completion_messages(),
-                input_ids=group.prompt_ids + c.get_completion_ids(),
-                completion_mask=[0] * len(group.prompt_ids) + c.get_tool_mask(),
-                old_log_probs=[0.0] * len(group.prompt_ids) + c.get_completion_logprobs(),
-                advantage=advantage,
-                model_version=group.model_version,
-                metrics={
-                    "reward": float(reward),
-                    "reward_std": reward_std,
-                    **{
-                        f"rewards/{name}": float(func_reward)
-                        for name, func_reward in zip(self.reward_func_names, per_func_rewards[:, i], strict=True)
+        logger.info(f"Rollout metrics: reward_mean={reward_mean:.4f}, reward_std={reward_std:.4f}")
+
+        samples = []
+        for i, (c, advantage, reward, completion_tool_metrics) in enumerate(
+            zip(group.completions, advantages, rewards, tool_metrics, strict=True)
+        ):
+            # Trajectory metrics
+            traj_metrics = _extract_tool_metrics(c.turns)
+            traj_metrics["rollout/total_duration_s"] = c.total_duration_s
+            traj_metrics["rollout/turn_generation_duration_s"] = sum(t.generation_duration for t in c.turns)
+            traj_metrics["rollout/truncated"] = float(c.truncated)
+            traj_metrics["rollout/num_turns"] = float(len(c.turns))
+
+            samples.append(
+                RolloutSample(
+                    prompt=group.prompt,
+                    completion=c.get_completion_messages(),
+                    input_ids=group.prompt_ids + c.get_completion_ids(),
+                    completion_mask=[0] * len(group.prompt_ids) + c.get_tool_mask(),
+                    old_log_probs=[0.0] * len(group.prompt_ids) + c.get_completion_logprobs(),
+                    advantage=advantage,
+                    model_version=group.model_version,
+                    metrics={
+                        "advantage": advantage,
+                        "reward": float(reward),
+                        "reward_mean": float(reward_mean),
+                        "reward_std": reward_std,
+                        **{
+                            f"rewards/{name}": float(func_reward)
+                            for name, func_reward in zip(self.reward_func_names, per_func_rewards[:, i], strict=True)
+                        },
+                        **completion_tool_metrics,
+                        **traj_metrics,
                     },
-                    **tm,
-                },
-            )
-            for i, (c, advantage, reward, tm) in enumerate(
-                zip(
-                    group.completions,
-                    advantages,
-                    rewards,
-                    tool_metrics,
-                    strict=True,
                 )
             )
-        ]
+        return samples
 
     async def _post(self, path: str, payload: dict, timeout: float, max_retries: int = 3) -> dict:
         client_timeout = aiohttp.ClientTimeout(total=timeout)
