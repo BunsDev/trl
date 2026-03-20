@@ -1397,19 +1397,46 @@ class GRPOTrainer(_BaseTrainer):
             return_dict=False,
             **self.chat_template_kwargs,
         )
-        full_ids = self.processing_class.apply_chat_template(
-            dummy_messages + tool_messages,
-            add_generation_prompt=True,
-            tokenize=True,
-            chat_template=self.chat_template,
-            return_dict=False,
-            **self.chat_template_kwargs,
-        )
         # VLM processors return batched output (list of lists), unbatch for single conversation
         if isinstance(prefix_ids, list) and len(prefix_ids) == 1 and isinstance(prefix_ids[0], list):
             prefix_ids = prefix_ids[0]
-        if isinstance(full_ids, list) and len(full_ids) == 1 and isinstance(full_ids[0], list):
-            full_ids = full_ids[0]
+
+        # Check if tool messages contain images (multimodal tool responses)
+        tool_images = []
+        for msg in tool_messages:
+            if isinstance(msg.get("content"), list):
+                for part in msg["content"]:
+                    if isinstance(part, dict) and part.get("type") == "image":
+                        tool_images.append(part["image"])
+
+        if tool_images and hasattr(self.processing_class, "image_processor"):
+            # For VLMs with images: use processor.__call__ to get correctly expanded image tokens.
+            # apply_chat_template only inserts a single <|image_pad|> placeholder per image,
+            # but the model needs N tokens per image (based on resolution). The processor's
+            # __call__ handles this expansion.
+            full_text = self.processing_class.apply_chat_template(
+                dummy_messages + tool_messages,
+                add_generation_prompt=True,
+                tokenize=False,
+                chat_template=self.chat_template,
+                **self.chat_template_kwargs,
+            )
+            full_result = self.processing_class(
+                text=full_text, images=tool_images, return_tensors="pt"
+            )
+            full_ids = full_result["input_ids"][0].tolist()
+        else:
+            full_ids = self.processing_class.apply_chat_template(
+                dummy_messages + tool_messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                chat_template=self.chat_template,
+                return_dict=False,
+                **self.chat_template_kwargs,
+            )
+            if isinstance(full_ids, list) and len(full_ids) == 1 and isinstance(full_ids[0], list):
+                full_ids = full_ids[0]
+
         if not full_ids[: len(prefix_ids)] == prefix_ids:
             raise ValueError("Unexpected tokenization: the prefix IDs are not a prefix of the full IDs.")
         return full_ids[len(prefix_ids) :]
@@ -1420,6 +1447,8 @@ class GRPOTrainer(_BaseTrainer):
         idxs_with_tool = [idx for idx, tool_call in enumerate(tool_calls) if tool_call]
         tool_calls = [tool_calls[idx] for idx in idxs_with_tool]
         tool_mask = [[1] * len(ids) for ids in completion_ids]  # 0 for tool result tokens, 1 elsewhere
+        # Collect images from multimodal tool responses for the forward pass
+        tool_images = [[] for _ in completion_ids]
         tool_call_count = 0
         tool_failure_count = 0
         iteration_num = 0
@@ -1482,6 +1511,11 @@ class GRPOTrainer(_BaseTrainer):
                     # pass them through directly so _tokenize_prompts can extract images for VLMs.
                     content = result if isinstance(result, list) else str(result)
                     tool_message = {"role": "tool", "name": name, "content": content}
+                    # Collect images from multimodal tool responses
+                    if isinstance(content, list):
+                        for part in content:
+                            if isinstance(part, dict) and part.get("type") == "image":
+                                tool_images[idx_with_tool].append(part["image"])
                     prompt_completion_tool.append(tool_message)
                     completions[idx_with_tool].append(tool_message)
 
@@ -1599,7 +1633,7 @@ class GRPOTrainer(_BaseTrainer):
             idxs_with_tool = [idx for idx, tool_call in zip(idxs_with_tool, tool_calls, strict=True) if tool_call]
             tool_calls = [tool_call for tool_call in tool_calls if tool_call]
             iteration_num += 1
-        return tool_mask, completions, completion_ids, logprobs, tool_call_count, tool_failure_count
+        return tool_mask, completions, completion_ids, logprobs, tool_call_count, tool_failure_count, tool_images
 
     def _generate(self, prompts: list):
         device = self.accelerator.device
@@ -1662,9 +1696,19 @@ class GRPOTrainer(_BaseTrainer):
                 logprobs,
                 tool_call_count,
                 tool_failure_count,
+                tool_images,
             ) = self._tool_call_loop(
                 prompts, prompt_ids, completion_ids, completions, logprobs, images, multimodal_fields
             )
+            # Merge tool response images into the images list for the forward pass
+            has_tool_images = any(imgs for imgs in tool_images)
+            if has_tool_images:
+                if images is None:
+                    images = [imgs if imgs else None for imgs in tool_images]
+                else:
+                    images = [
+                        (existing or []) + new for existing, new in zip(images, tool_images, strict=True)
+                    ]
         else:
             # Support custom env_mask from rollout_func (e.g., for environment feedback masking)
             # Internally treated as tool_mask - marks model tokens (1) vs external tokens (0)
@@ -1831,25 +1875,6 @@ class GRPOTrainer(_BaseTrainer):
 
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
         batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
-
-        # For VLMs with tools, re-extract all images from the full conversation. After the tool loop,
-        # prompts contain both dataset images (from prepare_multimodal_messages) and tool response
-        # images (from multimodal tool returns in _tool_call_loop). We need all of them for the
-        # forward pass to compute pixel_values correctly.
-        if self.tools and hasattr(self.processing_class, "image_processor"):
-            all_images = []
-            has_images = False
-            for prompt in prompts:
-                sample_images = []
-                for message in prompt:
-                    if isinstance(message.get("content"), list):
-                        for part in message["content"]:
-                            if isinstance(part, dict) and part.get("type") == "image":
-                                sample_images.append(part["image"])
-                                has_images = True
-                all_images.append(sample_images if sample_images else None)
-            if has_images:
-                images = all_images
 
         num_images = [len(img_list) if img_list else 0 for img_list in images] if images is not None else None
 
