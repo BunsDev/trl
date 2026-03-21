@@ -53,7 +53,9 @@ class _ChunkedLogProbFunction(torch.autograd.Function):
         for start in range(0, vocab, chunk_size):
             end = min(start + chunk_size, vocab)
             C = end - start
-            w_chunk = weight[start:end]  # [C, H]
+            # using fp16=True, the model's hidden states get cast to float16 by autocast, but the mm_buf is allocated
+            # with last_hidden.dtype (float16) while w_chunk (the lm_head weights) is not auto casted
+            w_chunk = weight[start:end].to(last_hidden.dtype)  # [C, H]
             torch.mm(last_hidden, w_chunk.t(), out=mm_buf[:, :C])
             logits_chunk = logits_buf[:, :C]
             logits_chunk.copy_(mm_buf[:, :C])
