@@ -59,6 +59,14 @@ class AsyncGRPOConfig(_BaseConfig):
         epsilon_high (`float`, *optional*, defaults to `0.2`):
             Upper-bound epsilon value for clipping.
 
+        > Parameters that control the LM head
+
+        chunk_lm_head (`int` or `None`, *optional*, defaults to `None`):
+            Chunk size for the fused LM head. When set, the lm_head computes log-probs and entropy without
+            materializing the full `[batch, seq, vocab]` logits tensor, processing the vocabulary in chunks of this
+            size instead. Reduces peak memory at the cost of extra matmuls. If `None`, uses the standard full-logits
+            path.
+
         > Parameters that control the async rollout pipeline
 
         max_inflight_tasks (`int`, *optional*, defaults to `-1`):
@@ -156,6 +164,17 @@ class AsyncGRPOConfig(_BaseConfig):
     epsilon_high: float = field(
         default=0.2,
         metadata={"help": "Upper-bound epsilon value for clipping."},
+    )
+
+    # Parameters that control the LM head
+    chunk_lm_head: int | None = field(
+        default=None,
+        metadata={
+            "help": "Chunk size for the fused LM head. When set, the lm_head computes log-probs and entropy "
+            "without materializing the full [batch, seq, vocab] logits tensor, processing the vocabulary in "
+            "chunks of this size instead. Reduces peak memory at the cost of extra matmuls. If None, uses "
+            "the standard full-logits path."
+        },
     )
 
     # Parameters that control the async rollout pipeline

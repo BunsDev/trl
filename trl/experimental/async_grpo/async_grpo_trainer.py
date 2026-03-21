@@ -34,6 +34,7 @@ from trl.trainer.utils import pad, selective_log_softmax
 
 from .async_grpo_config import AsyncGRPOConfig
 from .async_rollout_worker import AsyncRolloutWorker
+from .chunk_lm_head import patch_chunked_lm_head
 
 
 logger = get_logger(__name__)
@@ -291,6 +292,9 @@ class AsyncGRPOTrainer(_BaseTrainer):
         model_name = model
         model = AutoModelForCausalLM.from_pretrained(model, device_map=None, dtype=torch.bfloat16)
 
+        if self.args.chunk_lm_head is not None:
+            patch_chunked_lm_head(model, self.args.chunk_lm_head, self.temperature)
+
         # Processing class
         if processing_class is None:
             processing_class = AutoTokenizer.from_pretrained(model_name)
@@ -404,11 +408,11 @@ class AsyncGRPOTrainer(_BaseTrainer):
                 dataset,
                 batch_size=self.args.per_device_train_batch_size * self.accelerator.num_processes,
                 collate_fn=DataCollatorForRollout(self.processing_class.pad_token_id),
-                num_workers=0,  # MUST be 0
+                num_workers=0,
+                # NOTE(@aminediro):
+                # dispatch_batches = True for DataLoader whose underlying dataset is an IterableDataset
+                # dataloader prepared by the Accelerator is only iterated through on the main process a
             )
-            # NOTE(@aminediro):
-            # dispatch_batches = True for DataLoader whose underlying dataset is an IterableDataset
-            # dataloader prepared by the Accelerator is only iterated through on the main process a
         )
 
     def _set_signature_columns_if_needed(self):
@@ -444,13 +448,20 @@ class AsyncGRPOTrainer(_BaseTrainer):
         old_log_probs = old_log_probs[:, :local_max_len]
 
         forward_start = time.time()
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+        use_chunked = self.args.chunk_lm_head is not None
+
+        logits, entropy = None, None
+        if use_chunked:
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=input_ids, use_cache=False)
+            log_probs = outputs["log_probs"]
+            entropy = outputs["entropy"]
+        else:
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+            logits = outputs.logits[:, :-1, :]
+            logits.div_(self.temperature)
+            log_probs = selective_log_softmax(logits, input_ids[:, 1:])
         self._last_forward_time_s = time.time() - forward_start
 
-        logits = outputs.logits[:, :-1, :]
-        targets = input_ids[:, 1:]
-        logits.div_(self.temperature)
-        log_probs = selective_log_softmax(logits, targets)
         completion_mask = completion_mask[:, 1:]
         old_log_probs = old_log_probs[:, 1:]
         advantages = advantages.unsqueeze(1)
@@ -485,9 +496,13 @@ class AsyncGRPOTrainer(_BaseTrainer):
                 else torch.zeros((), device=completion_mask.device)
             )
 
-            probs = torch.softmax(logits, dim=-1)
-            log_p = torch.log_softmax(logits, dim=-1)
-            entropy = -torch.sum(probs * log_p, dim=-1)
+            if not use_chunked:
+                assert logits is not None, "Logits are only computed on non-chunked forward"
+                probs = torch.softmax(logits, dim=-1)
+                log_p = torch.log_softmax(logits, dim=-1)
+                entropy = -torch.sum(probs * log_p, dim=-1)
+
+            assert entropy is not None
             local_entropy_sum = (
                 entropy[valid_mask].sum() if valid_mask.any() else torch.zeros((), device=completion_mask.device)
             )
