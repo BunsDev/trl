@@ -292,8 +292,14 @@ class AsyncGRPOTrainer(_BaseTrainer):
         model_name = model
         model = AutoModelForCausalLM.from_pretrained(model, device_map=None, dtype=torch.bfloat16)
 
-        if self.args.chunk_lm_head is not None:
-            patch_chunked_lm_head(model, self.args.chunk_lm_head, self.temperature)
+        if self.args.chunk_lm_head_size is not None and self.args.use_liger_kernel:
+            raise ValueError(
+                "`chunk_lm_head_size` and `use_liger_kernel` cannot both be set. "
+                "Both optimize the LM head forward pass to avoid materializing full logits; pick one."
+            )
+
+        if self.args.chunk_lm_head_size is not None:
+            patch_chunked_lm_head(model, self.args.chunk_lm_head_size, self.temperature)
 
         # Processing class
         if processing_class is None:
@@ -448,7 +454,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
         old_log_probs = old_log_probs[:, :local_max_len]
 
         forward_start = time.time()
-        use_chunked = self.args.chunk_lm_head is not None
+        use_chunked = self.args.chunk_lm_head_size is not None
 
         logits, entropy = None, None
         if use_chunked:
