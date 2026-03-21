@@ -40,16 +40,24 @@ class _ChunkedLogProbFunction(torch.autograd.Function):
         vocab, _ = weight.shape
         inv_t = 1.0 / temperature
 
-        # Online logsumexp accumulators (fp32 for stability)
+        # NOTE(@aminediro): always acc in fp32 for stability
         max_old = torch.full((N,), float("-inf"), device=device, dtype=torch.float32)
         sum_exp = torch.zeros((N,), device=device, dtype=torch.float32)
         x_sum_exp = torch.zeros((N,), device=device, dtype=torch.float32)
         target_logit = torch.zeros((N,), device=device, dtype=torch.float32)
 
+        # Pre-allocate reusable buffers to avoid per-chunk allocation
+        mm_buf = torch.empty((N, chunk_size), device=device, dtype=last_hidden.dtype)
+        logits_buf = torch.empty((N, chunk_size), device=device, dtype=torch.float32)
+
         for start in range(0, vocab, chunk_size):
             end = min(start + chunk_size, vocab)
+            C = end - start
             w_chunk = weight[start:end]  # [C, H]
-            logits_chunk = (last_hidden @ w_chunk.t()).to(torch.float32) * inv_t  # [N, C]
+            torch.mm(last_hidden, w_chunk.t(), out=mm_buf[:, :C])
+            logits_chunk = logits_buf[:, :C]
+            logits_chunk.copy_(mm_buf[:, :C])
+            logits_chunk.mul_(inv_t)  # [N, C]
 
             # Online logsumexp update
             chunk_max = logits_chunk.amax(dim=-1)  # [N]
@@ -96,13 +104,21 @@ class _ChunkedLogProbFunction(torch.autograd.Function):
         grad_hidden = torch.zeros(hidden.shape, device=hidden.device, dtype=torch.float32)
         grad_weight = torch.zeros(weight.shape, device=weight.device, dtype=torch.float32)
 
+        # Pre-allocate reusable buffers to avoid per-chunk allocation
+        mm_buf = torch.empty((N, chunk_size), device=hidden.device, dtype=hidden.dtype)
+        logits_buf = torch.empty((N, chunk_size), device=hidden.device, dtype=torch.float32)
+
         g = grad_logprobs.to(torch.float32)  # [N]
 
         for start in range(0, vocab, chunk_size):
             end = min(start + chunk_size, vocab)
+            C = end - start
             w_chunk = weight[start:end]  # [C, H]
 
-            logits_chunk = (hidden @ w_chunk.t()).to(torch.float32) * inv_t  # [N, C]
+            torch.mm(hidden, w_chunk.t(), out=mm_buf[:, :C])
+            logits_chunk = logits_buf[:, :C]
+            logits_chunk.copy_(mm_buf[:, :C])
+            logits_chunk.mul_(inv_t)  # [N, C]
             probs = torch.exp(logits_chunk - log_z.unsqueeze(-1))  # [N, C]
 
             # dL/d(logits) = g * (1_{label} - p)
@@ -127,6 +143,7 @@ def patch_chunked_lm_head(model: nn.Module, chunk_size: int, temperature: float)
         input_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
+        completion_mask: torch.Tensor | None = None,
         use_cache: bool = False,
         **kwargs,
     ) -> dict[str, torch.Tensor]:
@@ -143,9 +160,26 @@ def patch_chunked_lm_head(model: nn.Module, chunk_size: int, temperature: float)
         hidden_flat = hidden_states.reshape(b * s, h).contiguous()
         targets_flat = labels.reshape(b * s).contiguous()
 
-        logprobs, entropy = _ChunkedLogProbFunction.apply(
+        # Filter to completion tokens only to avoid expensive matmuls on prompt tokens and tool results
+        valid_mask = None
+        if completion_mask is not None:
+            completion_mask = completion_mask[:, 1:]  # same shift as labels
+            valid_mask = completion_mask.bool().reshape(b * s)
+            hidden_flat = hidden_flat[valid_mask]  # [N_valid, H]
+            targets_flat = targets_flat[valid_mask]  # [N_valid]
+
+        logprobs_valid, entropy_valid = _ChunkedLogProbFunction.apply(
             hidden_flat, self.lm_head.weight, targets_flat, temperature, chunk_size
         )
+
+        if valid_mask is not None:
+            logprobs = torch.zeros(b * s, device=logprobs_valid.device, dtype=logprobs_valid.dtype)
+            entropy = torch.zeros(b * s, device=entropy_valid.device, dtype=entropy_valid.dtype)
+            logprobs[valid_mask] = logprobs_valid
+            entropy[valid_mask] = entropy_valid
+        else:
+            logprobs = logprobs_valid
+            entropy = entropy_valid
 
         return {
             "log_probs": logprobs.reshape(b, s),

@@ -452,7 +452,13 @@ class AsyncGRPOTrainer(_BaseTrainer):
 
         logits, entropy = None, None
         if use_chunked:
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=input_ids, use_cache=False)
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=input_ids,
+                completion_mask=completion_mask,
+                use_cache=False,
+            )
             log_probs = outputs["log_probs"]
             entropy = outputs["entropy"]
         else:
