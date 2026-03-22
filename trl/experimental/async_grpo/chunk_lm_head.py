@@ -144,7 +144,7 @@ def patch_chunked_lm_head(model: nn.Module, chunk_size: int, temperature: float)
         use_cache: bool = False,
         **kwargs,
     ) -> dict[str, torch.Tensor]:
-        assert labels is not None, "requires labels to be not None for logprob computation"
+        assert labels is not None, "requires labels to not be None for logprob computation"
 
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, use_cache=use_cache, **kwargs)
         hidden_states = outputs.last_hidden_state  # [B, S+1, H]
