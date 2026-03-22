@@ -74,13 +74,8 @@ class _ChunkedLogProbFunction(torch.autograd.Function):
             # Gather target logits for labels in this chunk
             in_chunk_cond = (targets >= start) & (targets < end)
             local_idx = torch.clamp(targets - start, 0, end - start - 1)
-            target_logit = torch.where(
-                in_chunk_cond,
-                # take the new logit if target_idx is in this chunk bounds
-                # otherwise, keep the old value
-                logits_chunk[torch.arange(N, device=device), local_idx],
-                target_logit,
-            )
+            # take the new logit if target_idx is in this chunk bounds else 0
+            target_logit += logits_chunk[torch.arange(N, device=device), local_idx] * in_chunk_cond
 
         log_z = max_old + torch.log(sum_exp)
         logprobs = target_logit - log_z
@@ -111,7 +106,6 @@ class _ChunkedLogProbFunction(torch.autograd.Function):
         logits_buf = torch.empty((N, chunk_size), device=hidden.device, dtype=torch.float32)
 
         g = grad_logprobs.to(torch.float32)  # [N]
-
         row_idx = torch.arange(N, device=hidden.device)
 
         for start in range(0, vocab, chunk_size):
@@ -131,12 +125,7 @@ class _ChunkedLogProbFunction(torch.autograd.Function):
             in_chunk_cond = (labels >= start) & (labels < end)
             local_idx = torch.clamp(labels - start, 0, end - start - 1)
             # If label in chunk add g to grad else it stays the same
-            grad_logits[row_idx, local_idx] = torch.where(
-                in_chunk_cond,
-                grad_logits[row_idx, local_idx] + g,
-                grad_logits[row_idx, local_idx],
-            )
-
+            grad_logits[row_idx, local_idx] += g * in_chunk_cond
             grad_logits = grad_logits * inv_t
 
             grad_hidden.add_(grad_logits @ w_chunk.float())
