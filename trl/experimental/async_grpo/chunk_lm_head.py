@@ -112,6 +112,8 @@ class _ChunkedLogProbFunction(torch.autograd.Function):
 
         g = grad_logprobs.to(torch.float32)  # [N]
 
+        row_idx = torch.arange(N, device=hidden.device)
+
         for start in range(0, vocab, chunk_size):
             end = min(start + chunk_size, vocab)
             C = end - start
@@ -123,14 +125,18 @@ class _ChunkedLogProbFunction(torch.autograd.Function):
             logits_chunk.mul_(inv_t)  # [N, C]
             probs = torch.exp(logits_chunk - log_z.unsqueeze(-1))  # [N, C]
 
-            # dL/d(logits) = g * (1_{label} - p)
+            # dL/d(logits) = g * (1_[label] - p)
             grad_logits = (-g).unsqueeze(-1) * probs  # [N, C]
-            mask = (labels >= start) & (labels < end)
-            if mask.any():
-                idx = (labels[mask] - start).to(torch.long)
-                grad_logits[mask, idx] += g[mask]
 
-            # Chain through temperature: scaled_logit = logit * inv_t
+            in_chunk_cond = (labels >= start) & (labels < end)
+            local_idx = torch.clamp(labels - start, 0, end - start - 1)
+            # If label in chunk add g to grad else it stays the same
+            grad_logits[row_idx, local_idx] = torch.where(
+                in_chunk_cond,
+                grad_logits[row_idx, local_idx] + g,
+                grad_logits[row_idx, local_idx],
+            )
+
             grad_logits = grad_logits * inv_t
 
             grad_hidden.add_(grad_logits @ w_chunk.float())
