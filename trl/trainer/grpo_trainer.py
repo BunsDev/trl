@@ -1388,7 +1388,14 @@ class GRPOTrainer(_BaseTrainer):
 
     def _get_tool_suffix_ids(self, tool_messages):
         """Get token IDs for tool result formatting by using a minimal dummy conversation."""
-        dummy_messages = [{"role": "user", "content": "dummy"}, {"role": "assistant", "content": "dummy"}]
+        # Use content blocks format for VLM processors that don't handle plain strings
+        if hasattr(self.processing_class, "image_processor"):
+            dummy_messages = [
+                {"role": "user", "content": [{"type": "text", "text": "dummy"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "dummy"}]},
+            ]
+        else:
+            dummy_messages = [{"role": "user", "content": "dummy"}, {"role": "assistant", "content": "dummy"}]
         prefix_ids = self.processing_class.apply_chat_template(
             dummy_messages,
             add_generation_prompt=False,
@@ -1409,6 +1416,7 @@ class GRPOTrainer(_BaseTrainer):
                     if isinstance(part, dict) and part.get("type") == "image":
                         tool_images.append(part["image"])
 
+        tool_multimodal_fields = {}
         if tool_images and hasattr(self.processing_class, "image_processor"):
             # For VLMs with images: use processor.__call__ to get correctly expanded image tokens.
             # apply_chat_template only inserts a single <|image_pad|> placeholder per image,
@@ -1425,7 +1433,17 @@ class GRPOTrainer(_BaseTrainer):
                 text=full_text, images=tool_images, return_tensors="pt"
             )
             full_ids = full_result["input_ids"][0].tolist()
+            # Save multimodal fields (pixel_values, image_grid_thw, etc.) to reuse in the forward pass,
+            # ensuring consistency between image tokens in suffix_ids and pixel features.
+            tool_multimodal_fields = {
+                k: v for k, v in full_result.items() if k not in ("input_ids", "attention_mask")
+            }
         else:
+            # Normalize string content in tool messages for VLM processors
+            if hasattr(self.processing_class, "image_processor"):
+                for msg in tool_messages:
+                    if isinstance(msg.get("content"), str):
+                        msg["content"] = [{"type": "text", "text": msg["content"]}]
             full_ids = self.processing_class.apply_chat_template(
                 dummy_messages + tool_messages,
                 add_generation_prompt=True,
@@ -1445,7 +1463,7 @@ class GRPOTrainer(_BaseTrainer):
 
         if full_ids[: len(prefix_ids)] != prefix_ids:
             raise ValueError("Unexpected tokenization: the EOS-trimmed prefix IDs are not a prefix of the full IDs.")
-        return full_ids[len(prefix_ids) :]
+        return full_ids[len(prefix_ids) :], tool_multimodal_fields
 
     def _tool_call_loop(self, prompts, prompt_ids, completion_ids, completions, logprobs, images, multimodal_fields):
         # Tool execution loop: execute tools, then regenerate completions with tool results appended to the prompt
@@ -1536,7 +1554,7 @@ class GRPOTrainer(_BaseTrainer):
                         tool_messages.insert(0, message)
                     else:
                         break
-                suffix_ids = self._get_tool_suffix_ids(tool_messages)
+                suffix_ids, _ = self._get_tool_suffix_ids(tool_messages)
                 prompt_completion_tool_ids.append(
                     prompt_ids[idx_with_tool] + completion_ids[idx_with_tool] + suffix_ids
                 )
@@ -1779,6 +1797,7 @@ class GRPOTrainer(_BaseTrainer):
             total_completion_tokens,
             logprobs,
             extra_fields,
+            images,
         )
 
     def _generate_and_score_completions(
@@ -1830,6 +1849,7 @@ class GRPOTrainer(_BaseTrainer):
             num_items_in_batch,
             sampling_per_token_logps_list,
             extra_fields,
+            images,
         ) = self._generate(prompts)
 
         # Convert lists of token IDs to padded tensors
@@ -1893,9 +1913,26 @@ class GRPOTrainer(_BaseTrainer):
         num_images = [len(img_list) if img_list else 0 for img_list in images] if images is not None else None
 
         # Get forward_kwargs for models with multimodal inputs
-        if images is not None:
-            total_imgs = sum(len(x) for x in images if x)
-            print(f"  [VLM DEBUG] Forward pass: {total_imgs} total images, num_images={num_images}")
+        if images is not None and hasattr(self.processing_class, "image_processor"):
+            # For VLMs with tool images: process images through image_processor and construct
+            # mm_token_type_ids from prompt_completion_ids by detecting image/video pad tokens.
+            flat_images = [img for img_list in images if img_list for img in img_list]
+            print(f"  [VLM DEBUG] Forward pass: {len(flat_images)} images via image_processor + mm_token_type_ids")
+
+            # Get pixel_values and image_grid_thw from image processor
+            image_inputs = self.processing_class.image_processor(images=flat_images, return_tensors="pt")
+            image_inputs = super()._prepare_inputs(image_inputs)
+            forward_kwargs = dict(image_inputs)
+
+            # Build mm_token_type_ids from prompt_completion_ids AFTER the extension code below,
+            # since our mm_token_type_ids already covers the full prompt+completion sequence.
+            # Store the data needed to build it; it will be set after the extension block.
+            self._build_mm_token_type_ids = True
+
+            for k, v in forward_kwargs.items():
+                if hasattr(v, 'shape'):
+                    print(f"  [VLM DEBUG] forward_kwargs[{k}].shape = {v.shape}")
+        elif images is not None:
             prompts_text = [
                 apply_chat_template(
                     {"prompt": prompt}, self.processing_class, tools=self.tools, **self.chat_template_kwargs
@@ -1905,10 +1942,6 @@ class GRPOTrainer(_BaseTrainer):
             prompt_inputs = self.processing_class(images=images, text=prompts_text, padding=True, return_tensors="pt")
             prompt_inputs = super()._prepare_inputs(prompt_inputs)
             forward_kwargs = {k: v for k, v in prompt_inputs.items() if k not in ["input_ids", "attention_mask"]}
-            # DEBUG: confirm pixel_values are computed
-            for k, v in forward_kwargs.items():
-                if hasattr(v, 'shape'):
-                    print(f"  [VLM DEBUG] forward_kwargs[{k}].shape = {v.shape}")
         else:
             forward_kwargs = {}
             print(f"  [VLM DEBUG] No images for forward pass")
@@ -1940,6 +1973,55 @@ class GRPOTrainer(_BaseTrainer):
             forward_kwargs["mm_token_type_ids"] = torch.cat(
                 [mm_token_type_ids, mm_token_type_ids.new_zeros(completion_ids.shape)], dim=1
             )
+
+        # For VLM tool images: build mm_token_type_ids from the full prompt_completion_ids.
+        # This must happen AFTER the mm_token_type_ids extension block above, because our version
+        # already covers the full sequence (images are in the completion, not just the prompt).
+        if getattr(self, "_build_mm_token_type_ids", False):
+            image_pad_id = self.processing_class.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+            video_pad_id = self.processing_class.tokenizer.convert_tokens_to_ids("<|video_pad|>")
+            mm_ids = torch.zeros_like(prompt_completion_ids)
+            if image_pad_id is not None:
+                mm_ids[prompt_completion_ids == image_pad_id] = 1
+            if video_pad_id is not None:
+                mm_ids[prompt_completion_ids == video_pad_id] = 2
+            forward_kwargs["mm_token_type_ids"] = mm_ids
+            self._build_mm_token_type_ids = False
+
+            # Truncation safety: if max_completion_length cut some image tokens, pixel_values may
+            # have more features than there are image tokens in input_ids. Trim to keep only
+            # images whose tokens are fully present.
+            actual_image_tokens = (mm_ids == 1).sum().item()
+            image_grid_thw = forward_kwargs.get("image_grid_thw")
+            if image_grid_thw is not None:
+                merge_length = getattr(self.processing_class.image_processor, "merge_size", 2) ** 2
+                # Count how many complete images fit in the actual token count
+                cumulative_tokens = 0
+                keep_images = 0
+                keep_pixels = 0
+                for i in range(image_grid_thw.shape[0]):
+                    img_tokens = image_grid_thw[i].prod().item() // merge_length
+                    if cumulative_tokens + img_tokens <= actual_image_tokens:
+                        cumulative_tokens += img_tokens
+                        keep_images += 1
+                        keep_pixels += image_grid_thw[i].prod().item()
+                    else:
+                        break
+                if keep_images < image_grid_thw.shape[0]:
+                    forward_kwargs["image_grid_thw"] = image_grid_thw[:keep_images]
+                    forward_kwargs["pixel_values"] = forward_kwargs["pixel_values"][:keep_pixels]
+                    # Zero out orphaned image tokens in mm_token_type_ids (from truncated images)
+                    mm_ids[mm_ids == 1] = 0  # reset all
+                    # Re-mark only the kept image tokens
+                    count = 0
+                    for b in range(mm_ids.shape[0]):
+                        for j in range(mm_ids.shape[1]):
+                            if prompt_completion_ids[b, j] == image_pad_id and count < cumulative_tokens:
+                                mm_ids[b, j] = 1
+                                count += 1
+                    forward_kwargs["mm_token_type_ids"] = mm_ids
+
+            print(f"  [VLM DEBUG] mm_token_type_ids: {mm_ids.shape}, image tokens: {actual_image_tokens}, image_grid_thw: {forward_kwargs.get('image_grid_thw', torch.tensor([])).shape}")
 
         # When gradient checkpointing is enabled with use_reentrant=True (non default), calling the model inside a
         # torch.no_grad() block triggers a harmless PyTorch warning ("None of the inputs have requires_grad=True").
