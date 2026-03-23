@@ -1581,6 +1581,8 @@ class GRPOTrainer(_BaseTrainer):
             )
 
             # Generate new completions after tool execution (using concatenated IDs, no re-tokenization)
+            loop_img_count = sum(len(x) for x in loop_images if x) if loop_images else 0
+            print(f"  [VLM DEBUG] Generation in tool loop: {loop_img_count} images passed to _generate_single_turn")
             post_tool_ids, post_tool_logprobs = self._generate_single_turn(
                 prompt_completion_tool_ids, loop_images, loop_multimodal_fields
             )
@@ -1708,6 +1710,9 @@ class GRPOTrainer(_BaseTrainer):
             )
             # Merge tool response images into the images list for the forward pass
             has_tool_images = any(imgs for imgs in tool_images)
+            # DEBUG: tool image collection
+            print(f"  [VLM DEBUG] tool_images per sample: {[len(imgs) for imgs in tool_images]}")
+            print(f"  [VLM DEBUG] completion_ids lengths: {[len(ids) for ids in completion_ids]}")
             if has_tool_images:
                 if images is None:
                     images = [imgs if imgs else None for imgs in tool_images]
@@ -1715,6 +1720,7 @@ class GRPOTrainer(_BaseTrainer):
                     images = [
                         (existing or []) + new for existing, new in zip(images, tool_images, strict=True)
                     ]
+                print(f"  [VLM DEBUG] images after merge: {[len(x) if x else 0 for x in images]}")
         else:
             # Support custom env_mask from rollout_func (e.g., for environment feedback masking)
             # Internally treated as tool_mask - marks model tokens (1) vs external tokens (0)
@@ -1886,6 +1892,8 @@ class GRPOTrainer(_BaseTrainer):
 
         # Get forward_kwargs for models with multimodal inputs
         if images is not None:
+            total_imgs = sum(len(x) for x in images if x)
+            print(f"  [VLM DEBUG] Forward pass: {total_imgs} total images, num_images={num_images}")
             prompts_text = [
                 apply_chat_template(
                     {"prompt": prompt}, self.processing_class, tools=self.tools, **self.chat_template_kwargs
@@ -1895,8 +1903,13 @@ class GRPOTrainer(_BaseTrainer):
             prompt_inputs = self.processing_class(images=images, text=prompts_text, padding=True, return_tensors="pt")
             prompt_inputs = super()._prepare_inputs(prompt_inputs)
             forward_kwargs = {k: v for k, v in prompt_inputs.items() if k not in ["input_ids", "attention_mask"]}
+            # DEBUG: confirm pixel_values are computed
+            for k, v in forward_kwargs.items():
+                if hasattr(v, 'shape'):
+                    print(f"  [VLM DEBUG] forward_kwargs[{k}].shape = {v.shape}")
         else:
             forward_kwargs = {}
+            print(f"  [VLM DEBUG] No images for forward pass")
 
         # If token_type_ids are used, extend them with zeros for the completion part
         if "token_type_ids" in forward_kwargs:
