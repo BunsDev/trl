@@ -34,11 +34,12 @@ class _ChunkedLogProbFunction(torch.autograd.Function):
         targets: torch.Tensor,  # [N]
         temperature: float,
         chunk_size: int,
+        logit_scale: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         device = last_hidden.device
         N, _ = last_hidden.shape
         vocab, _ = weight.shape
-        inv_t = 1.0 / temperature
+        inv_t = logit_scale / temperature
 
         # NOTE(@aminediro): always acc in fp32 for stability
         max_old = torch.full((N,), float("-inf"), device=device, dtype=torch.float32)
@@ -84,6 +85,7 @@ class _ChunkedLogProbFunction(torch.autograd.Function):
         ctx.save_for_backward(last_hidden, weight, targets, log_z)
         ctx.temperature = temperature
         ctx.chunk_size = chunk_size
+        ctx.logit_scale = logit_scale
 
         return logprobs, entropy
 
@@ -92,7 +94,8 @@ class _ChunkedLogProbFunction(torch.autograd.Function):
         hidden, weight, labels, log_z = ctx.saved_tensors
         temperature: float = ctx.temperature
         chunk_size: int = ctx.chunk_size
-        inv_t = 1.0 / temperature
+        logit_scale: float = ctx.logit_scale
+        inv_t = logit_scale / temperature
 
         N, _ = hidden.shape
         vocab = weight.shape[0]
@@ -131,7 +134,7 @@ class _ChunkedLogProbFunction(torch.autograd.Function):
             grad_hidden.add_(grad_logits @ w_chunk.float())
             grad_weight[start:end].add_(grad_logits.t() @ hidden.float())
 
-        return grad_hidden.to(hidden.dtype), grad_weight.to(weight.dtype), None, None, None
+        return grad_hidden.to(hidden.dtype), grad_weight.to(weight.dtype), None, None, None, None
 
 
 def patch_chunked_lm_head(model: nn.Module, chunk_size: int, temperature: float) -> None:
@@ -147,6 +150,8 @@ def patch_chunked_lm_head(model: nn.Module, chunk_size: int, temperature: float)
         assert labels is not None, "requires labels to not be None for logprob computation"
 
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, use_cache=use_cache, **kwargs)
+        # NOTE(@aminediro): supporting Cohere2 models
+        logit_scale = getattr(self.config, "logit_scale", 1.0)
         hidden_states = outputs.last_hidden_state  # [B, S+1, H]
 
         # Shift: predict next token
@@ -166,7 +171,7 @@ def patch_chunked_lm_head(model: nn.Module, chunk_size: int, temperature: float)
             targets_flat = targets_flat[valid_mask]  # [N_valid]
 
         logprobs_valid, entropy_valid = _ChunkedLogProbFunction.apply(
-            hidden_flat, self.lm_head.weight, targets_flat, temperature, chunk_size
+            hidden_flat, self.lm_head.weight, targets_flat, temperature, chunk_size, logit_scale
         )
 
         if valid_mask is not None:

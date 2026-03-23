@@ -29,12 +29,12 @@ from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase, TrainerCallback
 from transformers.data.data_collator import DataCollatorMixin
 
+from trl.experimental.chunk_lm_head import patch_chunked_lm_head
 from trl.trainer.base_trainer import _BaseTrainer
 from trl.trainer.utils import pad, selective_log_softmax
 
 from .async_grpo_config import AsyncGRPOConfig
 from .async_rollout_worker import AsyncRolloutWorker
-from .chunk_lm_head import patch_chunked_lm_head
 
 
 logger = get_logger(__name__)
@@ -299,7 +299,14 @@ class AsyncGRPOTrainer(_BaseTrainer):
             )
 
         if self.args.chunk_lm_head_size is not None:
-            patch_chunked_lm_head(model, self.args.chunk_lm_head_size, self.temperature)
+            if getattr(model.config, "final_logit_softcapping", None) is not None:
+                logger.warning(
+                    "Model has `final_logit_softcapping` which is not supported "
+                    "by chunked LM head. Disabling `chunk_lm_head_size`."
+                )
+                self.args.chunk_lm_head_size = None
+            else:
+                patch_chunked_lm_head(model, self.args.chunk_lm_head_size, self.temperature)
 
         # Processing class
         if processing_class is None:

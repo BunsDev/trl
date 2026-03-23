@@ -1,9 +1,12 @@
+import copy
+
 import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers import AutoModelForCausalLM
 
-from trl.experimental.async_grpo.chunk_lm_head import _ChunkedLogProbFunction, patch_chunked_lm_head
+from trl.experimental.chunk_lm_head import _ChunkedLogProbFunction, patch_chunked_lm_head
 
 
 N, H, V = 64, 32, 128
@@ -106,6 +109,7 @@ class _FakeCausalLM(nn.Module):
 
     def __init__(self, hidden_size, vocab_size):
         super().__init__()
+        self.config = type("Config", (), {})()
         self.model = _FakeTransformerModel(hidden_size)
         self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
 
@@ -188,3 +192,86 @@ def test_chunked_forward_completion_mask_backward(temperature):
     grad_weight_masked = model.lm_head.weight.grad.clone()
 
     torch.testing.assert_close(grad_weight_masked, grad_weight_full, atol=1e-5, rtol=1e-5)
+
+
+MODEL_IDS = [
+    "trl-internal-testing/tiny-CohereForCausalLM",
+    "trl-internal-testing/tiny-Cohere2ForCausalLM",
+    "trl-internal-testing/tiny-DeepseekV3ForCausalLM",
+    "trl-internal-testing/tiny-DeepseekV3ForCausalLM-0528",
+    "trl-internal-testing/tiny-Gemma2ForCausalLM",
+    "trl-internal-testing/tiny-GemmaForCausalLM",
+    "trl-internal-testing/tiny-Glm4MoeForCausalLM",
+    "trl-internal-testing/tiny-GptOssForCausalLM",
+    "trl-internal-testing/tiny-LlamaForCausalLM-3.1",
+    "trl-internal-testing/tiny-LlamaForCausalLM-3.2",
+    "trl-internal-testing/tiny-LlamaForCausalLM-3",
+    "trl-internal-testing/tiny-MistralForCausalLM-0.1",
+    "trl-internal-testing/tiny-MistralForCausalLM-0.2",
+    "trl-internal-testing/tiny-Phi3ForCausalLM",
+    "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+    "trl-internal-testing/tiny-Qwen3ForCausalLM",
+]
+
+
+class TestChunkedLmHeadRealModels:
+    @pytest.mark.parametrize("model_id", MODEL_IDS)
+    @pytest.mark.parametrize("temperature", [1.0, 0.7])
+    def test_forward(self, model_id, temperature):
+        device = torch.device("cuda")
+        model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16).to(device)
+        if getattr(model.config, "final_logit_softcapping", None) is not None:
+            pytest.skip("model uses final_logit_softcapping, not supported by chunked LM head")
+        model.eval()
+
+        B, S, chunk_size = 2, 8, 32
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, model.config.vocab_size, (B, S), device=device)
+        labels = input_ids.clone()
+
+        # Reference: standard forward → shifted logits → logprobs & entropy
+        with torch.no_grad():
+            ref_logits = model(input_ids=input_ids).logits[:, :-1, :].float() / temperature
+        shifted_labels = labels[:, 1:]
+        ref_log_p = F.log_softmax(ref_logits, dim=-1)
+        ref_logprobs = ref_log_p.gather(-1, shifted_labels.unsqueeze(-1)).squeeze(-1)
+        ref_p = ref_logits.softmax(dim=-1)
+        ref_entropy = -(ref_p * ref_log_p).sum(dim=-1)
+
+        # Chunked forward
+        patch_chunked_lm_head(model, chunk_size, temperature)
+        with torch.no_grad():
+            out = model(input_ids=input_ids, labels=labels)
+
+        torch.testing.assert_close(out["log_probs"], ref_logprobs, atol=5e-3, rtol=5e-3)
+        torch.testing.assert_close(out["entropy"], ref_entropy, atol=5e-3, rtol=5e-3)
+
+    @pytest.mark.parametrize("model_id", MODEL_IDS)
+    @pytest.mark.parametrize("temperature", [1.0, 0.7])
+    def test_backward(self, model_id, temperature):
+        device = torch.device("cuda")
+        model_ref = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16).to(device)
+        if getattr(model_ref.config, "final_logit_softcapping", None) is not None:
+            pytest.skip("model uses final_logit_softcapping, not supported by chunked LM head")
+        model_chunked = copy.deepcopy(model_ref)
+
+        B, S, chunk_size = 2, 8, 32
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, model_ref.config.vocab_size, (B, S), device=device)
+        labels = input_ids.clone()
+        shifted_labels = labels[:, 1:]
+
+        # Reference backward: standard logits → logprobs → backward
+        ref_logits = model_ref(input_ids=input_ids).logits[:, :-1, :].float() / temperature
+        ref_log_p = F.log_softmax(ref_logits, dim=-1)
+        ref_logprobs = ref_log_p.gather(-1, shifted_labels.unsqueeze(-1)).squeeze(-1)
+        ref_logprobs.sum().backward()
+        ref_grad = model_ref.lm_head.weight.grad.clone()
+
+        # Chunked backward
+        patch_chunked_lm_head(model_chunked, chunk_size, temperature)
+        out = model_chunked(input_ids=input_ids, labels=labels)
+        out["log_probs"].sum().backward()
+        chunked_grad = model_chunked.lm_head.weight.grad.clone()
+
+        torch.testing.assert_close(chunked_grad, ref_grad, atol=5e-2, rtol=5e-2)
