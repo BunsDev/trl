@@ -1465,6 +1465,40 @@ class GRPOTrainer(_BaseTrainer):
             raise ValueError("Unexpected tokenization: the EOS-trimmed prefix IDs are not a prefix of the full IDs.")
         return full_ids[len(prefix_ids) :], tool_multimodal_fields
 
+    def _truncate_at_image_boundary(self, ids, max_length):
+        """Truncate token ID list to max_length, ensuring we don't cut in the middle of an image.
+
+        If truncation would split an image token sequence (<|vision_start|>...<|vision_end|>),
+        backs up to the end of the last complete image. This prevents mismatches between
+        image placeholder tokens in input_ids and pixel_values in the forward pass.
+        """
+        if len(ids) <= max_length:
+            return ids
+
+        # Get special token IDs for image boundaries
+        if hasattr(self.processing_class, "image_processor") and hasattr(self.processing_class, "tokenizer"):
+            tok = self.processing_class.tokenizer
+            vision_end_id = tok.convert_tokens_to_ids("<|vision_end|>")
+            vision_start_id = tok.convert_tokens_to_ids("<|vision_start|>")
+
+            truncated = ids[:max_length]
+            # Check if we're inside an image sequence: find the last vision_start and vision_end
+            last_start = -1
+            last_end = -1
+            for i in range(len(truncated) - 1, -1, -1):
+                if truncated[i] == vision_end_id and last_end == -1:
+                    last_end = i
+                if truncated[i] == vision_start_id and last_start == -1:
+                    last_start = i
+                if last_start != -1 and last_end != -1:
+                    break
+
+            # If last vision_start > last vision_end, we're inside an incomplete image
+            if last_start > last_end:
+                return ids[:last_start]  # truncate before the incomplete image
+            return truncated
+        return ids[:max_length]
+
     def _tool_call_loop(self, prompts, prompt_ids, completion_ids, completions, logprobs, images, multimodal_fields):
         # Tool execution loop: execute tools, then regenerate completions with tool results appended to the prompt
         tool_calls = [completion[0].get("tool_calls") for completion in completions]
@@ -1580,7 +1614,9 @@ class GRPOTrainer(_BaseTrainer):
                 idx_with_tool = idxs_with_tool[idx]
                 if overlong[idx]:
                     prompt_length = len(prompt_ids[idx_with_tool])
-                    ct = prompt_completion_tool_ids[idx][prompt_length : prompt_length + self.max_completion_length]
+                    ct = self._truncate_at_image_boundary(
+                        prompt_completion_tool_ids[idx][prompt_length:], self.max_completion_length
+                    )
                     completion_ids[idx_with_tool] = ct
                     tool_mask[idx_with_tool] += [1] * (len(ct) - len(tool_mask[idx_with_tool]))
                     if logprobs is not None:
@@ -1614,14 +1650,20 @@ class GRPOTrainer(_BaseTrainer):
                 completion_tool_ids = prompt_completion_tool_ids[idx][prompt_len:]
                 excess_length = len(completion_tool_ids) + len(post_tool_ids[idx]) - self.max_completion_length
                 if excess_length > 0:
-                    # If exceeding max length, truncate post_tool_ids
-                    post_tool_ids[idx] = post_tool_ids[idx][:-excess_length]
+                    # If exceeding max length, truncate post_tool_ids (respecting image boundaries)
+                    truncated_post = self._truncate_at_image_boundary(
+                        post_tool_ids[idx], len(post_tool_ids[idx]) - excess_length
+                    )
                     if logprobs is not None:
-                        post_tool_logprobs[idx] = post_tool_logprobs[idx][:-excess_length]
+                        post_tool_logprobs[idx] = post_tool_logprobs[idx][:len(truncated_post)]
+                    post_tool_ids[idx] = truncated_post
                     excess_length = len(completion_tool_ids) + len(post_tool_ids[idx]) - self.max_completion_length
                     if excess_length > 0:
-                        # If still exceeding max length, truncate completion_tool_ids as well
-                        prompt_completion_tool_ids[idx] = prompt_completion_tool_ids[idx][:-excess_length]
+                        # If still exceeding, truncate completion_tool_ids (respecting image boundaries)
+                        truncated_pct = self._truncate_at_image_boundary(
+                            prompt_completion_tool_ids[idx], len(prompt_completion_tool_ids[idx]) - excess_length
+                        )
+                        prompt_completion_tool_ids[idx] = truncated_pct
 
             # Update tool_mask: the tool result should be 0 and the post-tool 1
             for idx in range(len(idxs_with_tool)):
@@ -1661,6 +1703,31 @@ class GRPOTrainer(_BaseTrainer):
             idxs_with_tool = [idx for idx, tool_call in zip(idxs_with_tool, tool_calls, strict=True) if tool_call]
             tool_calls = [tool_call for tool_call in tool_calls if tool_call]
             iteration_num += 1
+
+        # Sync tool_mask and tool_images with completion_ids: after truncation by
+        # _truncate_at_image_boundary, completion_ids may be shorter than tool_mask.
+        for i in range(len(completion_ids)):
+            if len(tool_mask[i]) > len(completion_ids[i]):
+                tool_mask[i] = tool_mask[i][:len(completion_ids[i])]
+            elif len(tool_mask[i]) < len(completion_ids[i]):
+                tool_mask[i] = tool_mask[i] + [1] * (len(completion_ids[i]) - len(tool_mask[i]))
+        if logprobs is not None:
+            for i in range(len(completion_ids)):
+                if len(logprobs[i]) > len(completion_ids[i]):
+                    logprobs[i] = logprobs[i][:len(completion_ids[i])]
+                elif len(logprobs[i]) < len(completion_ids[i]):
+                    logprobs[i] = logprobs[i] + [0.0] * (len(completion_ids[i]) - len(logprobs[i]))
+
+        # Sync tool_images: count complete images in completion_ids and trim tool_images to match.
+        if hasattr(self.processing_class, "tokenizer"):
+            vision_start_id = self.processing_class.tokenizer.convert_tokens_to_ids("<|vision_start|>")
+            vision_end_id = self.processing_class.tokenizer.convert_tokens_to_ids("<|vision_end|>")
+            if vision_start_id is not None and vision_end_id is not None:
+                for i, ids in enumerate(completion_ids):
+                    complete_images = sum(1 for t in ids if t == vision_end_id)
+                    if complete_images < len(tool_images[i]):
+                        tool_images[i] = tool_images[i][:complete_images]
+
         return tool_mask, completions, completion_ids, logprobs, tool_call_count, tool_failure_count, tool_images
 
     def _generate(self, prompts: list):
@@ -1988,40 +2055,37 @@ class GRPOTrainer(_BaseTrainer):
             forward_kwargs["mm_token_type_ids"] = mm_ids
             self._build_mm_token_type_ids = False
 
-            # Truncation safety: if max_completion_length cut some image tokens, pixel_values may
-            # have more features than there are image tokens in input_ids. Trim to keep only
-            # images whose tokens are fully present.
-            actual_image_tokens = (mm_ids == 1).sum().item()
+            # Truncation safety: if max_completion_length truncated some image tokens, the number
+            # of image pad tokens in input_ids won't match pixel_values features. Check per-sample
+            # and drop ALL images for any sample with a mismatch (safe fallback).
             image_grid_thw = forward_kwargs.get("image_grid_thw")
-            if image_grid_thw is not None:
+            if image_grid_thw is not None and num_images is not None:
                 merge_length = getattr(self.processing_class.image_processor, "merge_size", 2) ** 2
-                # Count how many complete images fit in the actual token count
-                cumulative_tokens = 0
-                keep_images = 0
-                keep_pixels = 0
-                for i in range(image_grid_thw.shape[0]):
-                    img_tokens = image_grid_thw[i].prod().item() // merge_length
-                    if cumulative_tokens + img_tokens <= actual_image_tokens:
-                        cumulative_tokens += img_tokens
-                        keep_images += 1
-                        keep_pixels += image_grid_thw[i].prod().item()
-                    else:
+                img_offset = 0
+                has_mismatch = False
+                for b in range(mm_ids.shape[0]):
+                    sample_tokens = (mm_ids[b] == 1).sum().item()
+                    sample_features = 0
+                    for i in range(num_images[b]):
+                        grid_idx = img_offset + i
+                        if grid_idx < image_grid_thw.shape[0]:
+                            sample_features += image_grid_thw[grid_idx].prod().item() // merge_length
+                    if sample_tokens != sample_features:
+                        has_mismatch = True
                         break
-                if keep_images < image_grid_thw.shape[0]:
-                    forward_kwargs["image_grid_thw"] = image_grid_thw[:keep_images]
-                    forward_kwargs["pixel_values"] = forward_kwargs["pixel_values"][:keep_pixels]
-                    # Zero out orphaned image tokens in mm_token_type_ids (from truncated images)
-                    mm_ids[mm_ids == 1] = 0  # reset all
-                    # Re-mark only the kept image tokens
-                    count = 0
-                    for b in range(mm_ids.shape[0]):
-                        for j in range(mm_ids.shape[1]):
-                            if prompt_completion_ids[b, j] == image_pad_id and count < cumulative_tokens:
-                                mm_ids[b, j] = 1
-                                count += 1
-                    forward_kwargs["mm_token_type_ids"] = mm_ids
+                    img_offset += num_images[b]
 
-            print(f"  [VLM DEBUG] mm_token_type_ids: {mm_ids.shape}, image tokens: {actual_image_tokens}, image_grid_thw: {forward_kwargs.get('image_grid_thw', torch.tensor([])).shape}")
+                if has_mismatch:
+                    # Drop all images: safer than partial trim which is error-prone
+                    forward_kwargs.pop("pixel_values", None)
+                    forward_kwargs.pop("image_grid_thw", None)
+                    mm_ids.zero_()
+                    forward_kwargs["mm_token_type_ids"] = mm_ids
+                    num_images = None
+                    print(f"  [VLM DEBUG] Image/token mismatch from truncation, dropping images for this batch")
+
+            actual_image_tokens = (mm_ids == 1).sum().item()
+            print(f"  [VLM DEBUG] mm_token_type_ids: {mm_ids.shape}, image tokens: {actual_image_tokens}, num_images: {num_images}, image_grid_thw: {forward_kwargs.get('image_grid_thw', torch.tensor([])).shape}")
 
         # When gradient checkpointing is enabled with use_reentrant=True (non default), calling the model inside a
         # torch.no_grad() block triggers a harmless PyTorch warning ("None of the inputs have requires_grad=True").
@@ -2690,7 +2754,10 @@ class GRPOTrainer(_BaseTrainer):
                 if images_raw:
                     images = []
                     for image_list in self._logs["images"]:
-                        images.append([logging_backend.Image(image) for image in image_list])
+                        if image_list:
+                            images.append([logging_backend.Image(image) for image in image_list])
+                        else:
+                            images.append([])
                     df = pd.concat(
                         [df_base, pd.Series(images, name="image")],
                         axis=1,
