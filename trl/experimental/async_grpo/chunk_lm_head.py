@@ -134,7 +134,152 @@ class _ChunkedLogProbFunction(torch.autograd.Function):
         return grad_hidden.to(hidden.dtype), grad_weight.to(weight.dtype), None, None, None
 
 
-def patch_chunked_lm_head(model: nn.Module, chunk_size: int, temperature: float) -> None:
+@torch.compile
+def _compiled_fwd_chunk_step(hidden, w_chunk, targets, max_old, sum_exp, x_sum_exp, target_logit, inv_t, start, end):
+    """Compiled forward step: matmul + online logsumexp update for one vocab chunk."""
+    logits_chunk = (hidden @ w_chunk.t()).float() * inv_t  # [N, C]
+
+    chunk_max = logits_chunk.amax(dim=-1)
+    max_new = torch.maximum(max_old, chunk_max)
+    rescale = torch.exp(max_old - max_new)
+    chunk_exp = torch.exp(logits_chunk - max_new.unsqueeze(-1))
+
+    sum_exp = sum_exp * rescale + chunk_exp.sum(dim=-1)
+    x_sum_exp = x_sum_exp * rescale + (chunk_exp * logits_chunk).sum(dim=-1)
+
+    in_chunk_cond = (targets >= start) & (targets < end)
+    local_idx = torch.clamp(targets - start, 0, end - start - 1)
+    N = hidden.shape[0]
+    target_logit = target_logit + logits_chunk[torch.arange(N, device=hidden.device), local_idx] * in_chunk_cond
+
+    return max_new, sum_exp, x_sum_exp, target_logit
+
+
+@torch.compile
+def _compiled_bwd_chunk_step(hidden, w_chunk, labels, log_z, g, row_idx, inv_t, start, end):
+    logits_chunk = (hidden @ w_chunk.t()).float() * inv_t  # [N, C]
+    probs = torch.exp(logits_chunk - log_z.unsqueeze(-1))
+
+    grad_logits = (-g).unsqueeze(-1) * probs
+    in_chunk_cond = (labels >= start) & (labels < end)
+    local_idx = torch.clamp(labels - start, 0, end - start - 1)
+    grad_logits = grad_logits.clone()
+    grad_logits[row_idx, local_idx] += g * in_chunk_cond
+    grad_logits = grad_logits * inv_t
+
+    grad_hidden_chunk = grad_logits @ w_chunk.float()
+    grad_weight_chunk = grad_logits.t() @ hidden.float()
+
+    return grad_hidden_chunk, grad_weight_chunk
+
+
+class _CompiledChunkedLogProbFunction(torch.autograd.Function):
+    """Like _ChunkedLogProbFunction but with compiled inner loop steps.
+
+    The Python for-loop stays eager (no massive graph unrolling),
+    but each iteration is compiled by Inductor for fused kernels.
+    """
+
+    @staticmethod
+    def forward(ctx, last_hidden, weight, targets, temperature, chunk_size):
+        device = last_hidden.device
+        N, _ = last_hidden.shape
+        vocab, _ = weight.shape
+        inv_t = 1.0 / temperature
+
+        max_old = torch.full((N,), float("-inf"), device=device, dtype=torch.float32)
+        sum_exp = torch.zeros(N, device=device, dtype=torch.float32)
+        x_sum_exp = torch.zeros(N, device=device, dtype=torch.float32)
+        target_logit = torch.zeros(N, device=device, dtype=torch.float32)
+
+        for start in range(0, vocab, chunk_size):
+            end = min(start + chunk_size, vocab)
+            w_chunk = weight[start:end].to(last_hidden.dtype)
+            max_old, sum_exp, x_sum_exp, target_logit = _compiled_fwd_chunk_step(
+                last_hidden, w_chunk, targets, max_old, sum_exp, x_sum_exp, target_logit, inv_t, start, end
+            )
+
+        log_z = max_old + torch.log(sum_exp)
+        logprobs = target_logit - log_z
+        entropy = log_z - x_sum_exp / sum_exp
+
+        ctx.save_for_backward(last_hidden, weight, targets, log_z)
+        ctx.temperature = temperature
+        ctx.chunk_size = chunk_size
+
+        return logprobs, entropy
+
+    @staticmethod
+    def backward(ctx, grad_logprobs, grad_entropy):
+        hidden, weight, labels, log_z = ctx.saved_tensors
+        temperature = ctx.temperature
+        chunk_size = ctx.chunk_size
+        inv_t = 1.0 / temperature
+
+        N, _ = hidden.shape
+        vocab = weight.shape[0]
+
+        grad_hidden = torch.zeros(hidden.shape, device=hidden.device, dtype=torch.float32)
+        grad_weight = torch.zeros(weight.shape, device=weight.device, dtype=torch.float32)
+
+        g = grad_logprobs.to(torch.float32)
+        row_idx = torch.arange(N, device=hidden.device)
+
+        for start in range(0, vocab, chunk_size):
+            end = min(start + chunk_size, vocab)
+            w_chunk = weight[start:end]
+            grad_h, grad_w = _compiled_bwd_chunk_step(hidden, w_chunk, labels, log_z, g, row_idx, inv_t, start, end)
+            grad_hidden.add_(grad_h)
+            grad_weight[start:end].add_(grad_w)
+
+        return grad_hidden.to(hidden.dtype), grad_weight.to(weight.dtype), None, None, None
+
+
+# Keep the full-compile version as well (slow to compile, fast to run)
+@torch.compile
+def compiled_chunked_logprob(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    targets: torch.Tensor,
+    temperature: float,
+    chunk_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Full-compile version: entire vocab loop compiled. Fast runtime but slow initial compilation."""
+    N = hidden.shape[0]
+    V = weight.shape[0]
+    inv_t = 1.0 / temperature
+
+    max_old = torch.full((N,), float("-inf"), device=hidden.device, dtype=torch.float32)
+    sum_exp = torch.zeros(N, device=hidden.device, dtype=torch.float32)
+    x_sum_exp = torch.zeros(N, device=hidden.device, dtype=torch.float32)
+    target_logit = torch.zeros(N, device=hidden.device, dtype=torch.float32)
+
+    for start in range(0, V, chunk_size):
+        end = min(start + chunk_size, V)
+        w_chunk = weight[start:end].to(hidden.dtype)
+        logits_chunk = (hidden @ w_chunk.t()).float() * inv_t
+
+        chunk_max = logits_chunk.amax(dim=-1)
+        max_new = torch.maximum(max_old, chunk_max)
+        rescale = torch.exp(max_old - max_new)
+        chunk_exp = torch.exp(logits_chunk - max_new.unsqueeze(-1))
+
+        sum_exp = sum_exp * rescale + chunk_exp.sum(dim=-1)
+        x_sum_exp = x_sum_exp * rescale + (chunk_exp * logits_chunk).sum(dim=-1)
+        max_old = max_new
+
+        in_chunk_cond = (targets >= start) & (targets < end)
+        local_idx = torch.clamp(targets - start, 0, end - start - 1)
+        target_logit = target_logit + logits_chunk[torch.arange(N, device=hidden.device), local_idx] * in_chunk_cond
+
+    log_z = max_old + torch.log(sum_exp)
+    logprobs = target_logit - log_z
+    entropy = (log_z - x_sum_exp / sum_exp).detach()
+
+    return logprobs, entropy
+
+
+def patch_chunked_lm_head(model: nn.Module, chunk_size: int, temperature: float, compiled: bool = False) -> None:
     def _chunked_forward(
         self: nn.Module,
         input_ids: torch.Tensor | None = None,
@@ -165,9 +310,18 @@ def patch_chunked_lm_head(model: nn.Module, chunk_size: int, temperature: float)
             hidden_flat = hidden_flat[valid_mask]  # [N_valid, H]
             targets_flat = targets_flat[valid_mask]  # [N_valid]
 
-        logprobs_valid, entropy_valid = _ChunkedLogProbFunction.apply(
-            hidden_flat, self.lm_head.weight, targets_flat, temperature, chunk_size
-        )
+        if compiled == "full":
+            logprobs_valid, entropy_valid = compiled_chunked_logprob(
+                hidden_flat, self.lm_head.weight, targets_flat, temperature, chunk_size
+            )
+        elif compiled == "step" or compiled is True:
+            logprobs_valid, entropy_valid = _CompiledChunkedLogProbFunction.apply(
+                hidden_flat, self.lm_head.weight, targets_flat, temperature, chunk_size
+            )
+        else:
+            logprobs_valid, entropy_valid = _ChunkedLogProbFunction.apply(
+                hidden_flat, self.lm_head.weight, targets_flat, temperature, chunk_size
+            )
 
         if valid_mask is not None:
             logprobs = torch.zeros(b * s, device=logprobs_valid.device, dtype=logprobs_valid.dtype)
