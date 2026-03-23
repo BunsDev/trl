@@ -1238,17 +1238,20 @@ class GRPOTrainer(_BaseTrainer):
         rewards_per_func = gather(rewards_per_func)
         return rewards_per_func
 
+    @staticmethod
+    def _normalize_message_content(messages):
+        """Normalize string content to content blocks in-place for VLM processor compatibility."""
+        for message in messages:
+            if isinstance(message.get("content"), str):
+                message["content"] = [{"type": "text", "text": message["content"]}]
+
     def _tokenize_prompts(self, prompts: list):
         """Tokenize prompts and extract images/multimodal fields for generation."""
         if is_conversational({"prompt": prompts[0]}):
-            # When the processor is a VLM processor, normalize string content to content blocks.
-            # Some VLM processors (e.g., Qwen3.5, Qwen3-VL) iterate over message["content"]
-            # assuming it's always a list of content blocks, which fails when content is a plain string.
+            # Normalize string content to content blocks for VLM processors that don't handle plain strings.
             if hasattr(self.processing_class, "image_processor"):
                 for prompt in prompts:
-                    for message in prompt:
-                        if isinstance(message["content"], str):
-                            message["content"] = [{"type": "text", "text": message["content"]}]
+                    self._normalize_message_content(prompt)
 
             # Extract images from messages for VLM support
             images = []
@@ -1388,14 +1391,9 @@ class GRPOTrainer(_BaseTrainer):
 
     def _get_tool_suffix_ids(self, tool_messages):
         """Get token IDs for tool result formatting by using a minimal dummy conversation."""
-        # Use content blocks format for VLM processors that don't handle plain strings
+        dummy_messages = [{"role": "user", "content": "dummy"}, {"role": "assistant", "content": "dummy"}]
         if hasattr(self.processing_class, "image_processor"):
-            dummy_messages = [
-                {"role": "user", "content": [{"type": "text", "text": "dummy"}]},
-                {"role": "assistant", "content": [{"type": "text", "text": "dummy"}]},
-            ]
-        else:
-            dummy_messages = [{"role": "user", "content": "dummy"}, {"role": "assistant", "content": "dummy"}]
+            self._normalize_message_content(dummy_messages)
         prefix_ids = self.processing_class.apply_chat_template(
             dummy_messages,
             add_generation_prompt=False,
@@ -1416,7 +1414,6 @@ class GRPOTrainer(_BaseTrainer):
                     if isinstance(part, dict) and part.get("type") == "image":
                         tool_images.append(part["image"])
 
-        tool_multimodal_fields = {}
         if tool_images and hasattr(self.processing_class, "image_processor"):
             # For VLMs with images: use processor.__call__ to get correctly expanded image tokens.
             # apply_chat_template only inserts a single <|image_pad|> placeholder per image,
@@ -1433,17 +1430,9 @@ class GRPOTrainer(_BaseTrainer):
                 text=full_text, images=tool_images, return_tensors="pt"
             )
             full_ids = full_result["input_ids"][0].tolist()
-            # Save multimodal fields (pixel_values, image_grid_thw, etc.) to reuse in the forward pass,
-            # ensuring consistency between image tokens in suffix_ids and pixel features.
-            tool_multimodal_fields = {
-                k: v for k, v in full_result.items() if k not in ("input_ids", "attention_mask")
-            }
         else:
-            # Normalize string content in tool messages for VLM processors
             if hasattr(self.processing_class, "image_processor"):
-                for msg in tool_messages:
-                    if isinstance(msg.get("content"), str):
-                        msg["content"] = [{"type": "text", "text": msg["content"]}]
+                self._normalize_message_content(tool_messages)
             full_ids = self.processing_class.apply_chat_template(
                 dummy_messages + tool_messages,
                 add_generation_prompt=True,
@@ -1463,7 +1452,34 @@ class GRPOTrainer(_BaseTrainer):
 
         if full_ids[: len(prefix_ids)] != prefix_ids:
             raise ValueError("Unexpected tokenization: the EOS-trimmed prefix IDs are not a prefix of the full IDs.")
-        return full_ids[len(prefix_ids) :], tool_multimodal_fields
+        return full_ids[len(prefix_ids) :]
+
+    def _get_vision_token_ids(self):
+        """Get vision-related special token IDs from the processor's tokenizer.
+
+        Returns a dict with keys 'vision_start', 'vision_end', 'image_pad', 'video_pad'.
+        Values are None if the token doesn't exist in the tokenizer's vocabulary.
+        Works across VLM families (Qwen, Gemma, LLaVA, etc.) by trying common token names.
+        """
+        if not hasattr(self, "_vision_token_ids_cache"):
+            cache = {"vision_start": None, "vision_end": None, "image_pad": None, "video_pad": None}
+            if hasattr(self.processing_class, "tokenizer"):
+                tok = self.processing_class.tokenizer
+                # Try common token names across VLM families
+                for name, candidates in {
+                    "vision_start": ["<|vision_start|>", "<|img_start|>"],
+                    "vision_end": ["<|vision_end|>", "<|img_end|>"],
+                    "image_pad": ["<|image_pad|>", "<|image|>", "<image>"],
+                    "video_pad": ["<|video_pad|>"],
+                }.items():
+                    for candidate in candidates:
+                        tid = tok.convert_tokens_to_ids(candidate)
+                        # convert_tokens_to_ids returns the unk_token_id for unknown tokens
+                        if tid != tok.unk_token_id:
+                            cache[name] = tid
+                            break
+            self._vision_token_ids_cache = cache
+        return self._vision_token_ids_cache
 
     def _truncate_at_image_boundary(self, ids, max_length):
         """Truncate token ID list to max_length, ensuring we don't cut in the middle of an image.
@@ -1475,14 +1491,11 @@ class GRPOTrainer(_BaseTrainer):
         if len(ids) <= max_length:
             return ids
 
-        # Get special token IDs for image boundaries
-        if hasattr(self.processing_class, "image_processor") and hasattr(self.processing_class, "tokenizer"):
-            tok = self.processing_class.tokenizer
-            vision_end_id = tok.convert_tokens_to_ids("<|vision_end|>")
-            vision_start_id = tok.convert_tokens_to_ids("<|vision_start|>")
-
+        vtids = self._get_vision_token_ids()
+        vision_start_id = vtids["vision_start"]
+        vision_end_id = vtids["vision_end"]
+        if vision_start_id is not None and vision_end_id is not None:
             truncated = ids[:max_length]
-            # Check if we're inside an image sequence: find the last vision_start and vision_end
             last_start = -1
             last_end = -1
             for i in range(len(truncated) - 1, -1, -1):
@@ -1588,7 +1601,7 @@ class GRPOTrainer(_BaseTrainer):
                         tool_messages.insert(0, message)
                     else:
                         break
-                suffix_ids, _ = self._get_tool_suffix_ids(tool_messages)
+                suffix_ids = self._get_tool_suffix_ids(tool_messages)
                 prompt_completion_tool_ids.append(
                     prompt_ids[idx_with_tool] + completion_ids[idx_with_tool] + suffix_ids
                 )
@@ -1637,8 +1650,6 @@ class GRPOTrainer(_BaseTrainer):
             )
 
             # Generate new completions after tool execution (using concatenated IDs, no re-tokenization)
-            loop_img_count = sum(len(x) for x in loop_images if x) if loop_images else 0
-            print(f"  [VLM DEBUG] Generation in tool loop: {loop_img_count} images passed to _generate_single_turn")
             post_tool_ids, post_tool_logprobs = self._generate_single_turn(
                 prompt_completion_tool_ids, loop_images, loop_multimodal_fields
             )
@@ -1719,14 +1730,12 @@ class GRPOTrainer(_BaseTrainer):
                     logprobs[i] = logprobs[i] + [0.0] * (len(completion_ids[i]) - len(logprobs[i]))
 
         # Sync tool_images: count complete images in completion_ids and trim tool_images to match.
-        if hasattr(self.processing_class, "tokenizer"):
-            vision_start_id = self.processing_class.tokenizer.convert_tokens_to_ids("<|vision_start|>")
-            vision_end_id = self.processing_class.tokenizer.convert_tokens_to_ids("<|vision_end|>")
-            if vision_start_id is not None and vision_end_id is not None:
-                for i, ids in enumerate(completion_ids):
-                    complete_images = sum(1 for t in ids if t == vision_end_id)
-                    if complete_images < len(tool_images[i]):
-                        tool_images[i] = tool_images[i][:complete_images]
+        vtids = self._get_vision_token_ids()
+        if vtids["vision_end"] is not None:
+            for i, ids in enumerate(completion_ids):
+                complete_images = sum(1 for t in ids if t == vtids["vision_end"])
+                if complete_images < len(tool_images[i]):
+                    tool_images[i] = tool_images[i][:complete_images]
 
         return tool_mask, completions, completion_ids, logprobs, tool_call_count, tool_failure_count, tool_images
 
@@ -1798,8 +1807,6 @@ class GRPOTrainer(_BaseTrainer):
             # Merge tool response images into the images list for the forward pass
             has_tool_images = any(imgs for imgs in tool_images)
             # DEBUG: tool image collection
-            print(f"  [VLM DEBUG] tool_images per sample: {[len(imgs) for imgs in tool_images]}")
-            print(f"  [VLM DEBUG] completion_ids lengths: {[len(ids) for ids in completion_ids]}")
             if has_tool_images:
                 if images is None:
                     images = [imgs if imgs else None for imgs in tool_images]
@@ -1807,7 +1814,6 @@ class GRPOTrainer(_BaseTrainer):
                     images = [
                         (existing or []) + new for existing, new in zip(images, tool_images, strict=True)
                     ]
-                print(f"  [VLM DEBUG] images after merge: {[len(x) if x else 0 for x in images]}")
         else:
             # Support custom env_mask from rollout_func (e.g., for environment feedback masking)
             # Internally treated as tool_mask - marks model tokens (1) vs external tokens (0)
@@ -1874,6 +1880,7 @@ class GRPOTrainer(_BaseTrainer):
         mode = "train" if self.model.training else "eval"
 
         prompts = [x["prompt"] for x in inputs]
+        build_mm_token_type_ids = False
 
         if self.environments:
             for prompt, environment, reset_kwargs in zip(prompts, self.environments, inputs, strict=True):
@@ -1984,7 +1991,6 @@ class GRPOTrainer(_BaseTrainer):
             # For VLMs with tool images: process images through image_processor and construct
             # mm_token_type_ids from prompt_completion_ids by detecting image/video pad tokens.
             flat_images = [img for img_list in images if img_list for img in img_list]
-            print(f"  [VLM DEBUG] Forward pass: {len(flat_images)} images via image_processor + mm_token_type_ids")
 
             # Get pixel_values and image_grid_thw from image processor
             image_inputs = self.processing_class.image_processor(images=flat_images, return_tensors="pt")
@@ -1994,11 +2000,7 @@ class GRPOTrainer(_BaseTrainer):
             # Build mm_token_type_ids from prompt_completion_ids AFTER the extension code below,
             # since our mm_token_type_ids already covers the full prompt+completion sequence.
             # Store the data needed to build it; it will be set after the extension block.
-            self._build_mm_token_type_ids = True
-
-            for k, v in forward_kwargs.items():
-                if hasattr(v, 'shape'):
-                    print(f"  [VLM DEBUG] forward_kwargs[{k}].shape = {v.shape}")
+            build_mm_token_type_ids = True
         elif images is not None:
             prompts_text = [
                 apply_chat_template(
@@ -2011,7 +2013,6 @@ class GRPOTrainer(_BaseTrainer):
             forward_kwargs = {k: v for k, v in prompt_inputs.items() if k not in ["input_ids", "attention_mask"]}
         else:
             forward_kwargs = {}
-            print(f"  [VLM DEBUG] No images for forward pass")
 
         # If token_type_ids are used, extend them with zeros for the completion part
         if "token_type_ids" in forward_kwargs:
@@ -2044,16 +2045,15 @@ class GRPOTrainer(_BaseTrainer):
         # For VLM tool images: build mm_token_type_ids from the full prompt_completion_ids.
         # This must happen AFTER the mm_token_type_ids extension block above, because our version
         # already covers the full sequence (images are in the completion, not just the prompt).
-        if getattr(self, "_build_mm_token_type_ids", False):
-            image_pad_id = self.processing_class.tokenizer.convert_tokens_to_ids("<|image_pad|>")
-            video_pad_id = self.processing_class.tokenizer.convert_tokens_to_ids("<|video_pad|>")
+        if build_mm_token_type_ids:
+            vtids = self._get_vision_token_ids()
             mm_ids = torch.zeros_like(prompt_completion_ids)
-            if image_pad_id is not None:
-                mm_ids[prompt_completion_ids == image_pad_id] = 1
-            if video_pad_id is not None:
-                mm_ids[prompt_completion_ids == video_pad_id] = 2
+            if vtids["image_pad"] is not None:
+                mm_ids[prompt_completion_ids == vtids["image_pad"]] = 1
+            if vtids["video_pad"] is not None:
+                mm_ids[prompt_completion_ids == vtids["video_pad"]] = 2
             forward_kwargs["mm_token_type_ids"] = mm_ids
-            self._build_mm_token_type_ids = False
+            build_mm_token_type_ids = False  # consumed
 
             # Truncation safety: if max_completion_length truncated some image tokens, the number
             # of image pad tokens in input_ids won't match pixel_values features. Check per-sample
@@ -2082,10 +2082,8 @@ class GRPOTrainer(_BaseTrainer):
                     mm_ids.zero_()
                     forward_kwargs["mm_token_type_ids"] = mm_ids
                     num_images = None
-                    print(f"  [VLM DEBUG] Image/token mismatch from truncation, dropping images for this batch")
 
             actual_image_tokens = (mm_ids == 1).sum().item()
-            print(f"  [VLM DEBUG] mm_token_type_ids: {mm_ids.shape}, image tokens: {actual_image_tokens}, num_images: {num_images}, image_grid_thw: {forward_kwargs.get('image_grid_thw', torch.tensor([])).shape}")
 
         # When gradient checkpointing is enabled with use_reentrant=True (non default), calling the model inside a
         # torch.no_grad() block triggers a harmless PyTorch warning ("None of the inputs have requires_grad=True").
