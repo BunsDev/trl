@@ -2003,20 +2003,18 @@ class GRPOTrainer(_BaseTrainer):
 
         num_images = [len(img_list) if img_list else 0 for img_list in images] if images is not None else None
 
-        # Get forward_kwargs for models with multimodal inputs
-        if images is not None and self._is_vlm:
-            # For VLMs with tool images: process images through image_processor and construct
-            # mm_token_type_ids from prompt_completion_ids by detecting image/video pad tokens.
+        # Get forward_kwargs for models with multimodal inputs.
+        # When tool images are present (from _tool_call_loop), use image_processor directly and build
+        # mm_token_type_ids from prompt_completion_ids. Otherwise, use the full processor pipeline
+        # which returns model-specific keys (image_sizes, pixel_attention_mask, etc.).
+        has_tool_images = self.tools and images is not None and any(
+            img for img_list in images if img_list for img in img_list
+        )
+        if has_tool_images and self._is_vlm:
             flat_images = [img for img_list in images if img_list for img in img_list]
-
-            # Get pixel_values and image_grid_thw from image processor
             image_inputs = self.processing_class.image_processor(images=flat_images, return_tensors="pt")
             image_inputs = super()._prepare_inputs(image_inputs)
             forward_kwargs = dict(image_inputs)
-
-            # Build mm_token_type_ids from prompt_completion_ids AFTER the extension code below,
-            # since our mm_token_type_ids already covers the full prompt+completion sequence.
-            # Store the data needed to build it; it will be set after the extension block.
             build_mm_token_type_ids = True
         elif images is not None:
             prompts_text = [
