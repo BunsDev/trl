@@ -1620,7 +1620,10 @@ class GRPOTrainer(_BaseTrainer):
             if self.use_vllm and self.vllm_mode == "colocate":
                 max_model_len = self.vllm_generation.llm.llm_engine.model_config.max_model_len
             elif self.use_vllm and self.vllm_mode == "server":
-                max_model_len = self.model.config.max_position_embeddings
+                if self._is_vlm:
+                    max_model_len = self.model.config.text_config.max_position_embeddings
+                else:
+                    max_model_len = self.model.config.max_position_embeddings
             elif not self.use_vllm:
                 if self._is_vlm:
                     max_model_len = self.model.config.text_config.max_position_embeddings
