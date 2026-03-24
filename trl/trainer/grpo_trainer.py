@@ -1432,9 +1432,7 @@ class GRPOTrainer(_BaseTrainer):
             )
             # We only need input_ids (for suffix token extraction). pixel_values and image_grid_thw
             # are computed separately in the forward pass via image_processor to avoid mismatches.
-            full_result = self.processing_class(
-                text=full_text, images=tool_images, return_tensors="pt"
-            )
+            full_result = self.processing_class(text=full_text, images=tool_images, return_tensors="pt")
             full_ids = full_result["input_ids"][0].tolist()
         else:
             if self._is_vlm:
@@ -1667,7 +1665,7 @@ class GRPOTrainer(_BaseTrainer):
                         post_tool_ids[idx], len(post_tool_ids[idx]) - excess_length
                     )
                     if logprobs is not None:
-                        post_tool_logprobs[idx] = post_tool_logprobs[idx][:len(truncated_post)]
+                        post_tool_logprobs[idx] = post_tool_logprobs[idx][: len(truncated_post)]
                     post_tool_ids[idx] = truncated_post
                     excess_length = len(completion_tool_ids) + len(post_tool_ids[idx]) - self.max_completion_length
                     if excess_length > 0:
@@ -1700,9 +1698,7 @@ class GRPOTrainer(_BaseTrainer):
             parsing_class = self.processing_class
             if self._is_vlm:
                 parsing_class = parsing_class.tokenizer
-            post_tool_completions = [
-                parse_response(parsing_class, ids) if ids else {} for ids in post_tool_ids
-            ]
+            post_tool_completions = [parse_response(parsing_class, ids) if ids else {} for ids in post_tool_ids]
 
             # Add post-tool completions to the existing completions
             for idx in range(len(idxs_with_tool)):
@@ -1720,13 +1716,13 @@ class GRPOTrainer(_BaseTrainer):
         # _truncate_at_image_boundary, completion_ids may be shorter than tool_mask.
         for i in range(len(completion_ids)):
             if len(tool_mask[i]) > len(completion_ids[i]):
-                tool_mask[i] = tool_mask[i][:len(completion_ids[i])]
+                tool_mask[i] = tool_mask[i][: len(completion_ids[i])]
             elif len(tool_mask[i]) < len(completion_ids[i]):
                 tool_mask[i] = tool_mask[i] + [1] * (len(completion_ids[i]) - len(tool_mask[i]))
         if logprobs is not None:
             for i in range(len(completion_ids)):
                 if len(logprobs[i]) > len(completion_ids[i]):
-                    logprobs[i] = logprobs[i][:len(completion_ids[i])]
+                    logprobs[i] = logprobs[i][: len(completion_ids[i])]
                 elif len(logprobs[i]) < len(completion_ids[i]):
                     logprobs[i] = logprobs[i] + [0.0] * (len(completion_ids[i]) - len(logprobs[i]))
 
@@ -1776,7 +1772,9 @@ class GRPOTrainer(_BaseTrainer):
             parsing_class = self.processing_class
             if self._is_vlm:
                 # Propagate response_schema from processor to tokenizer if needed
-                if getattr(self.processing_class, "response_schema", None) and not getattr(parsing_class.tokenizer, "response_schema", None):
+                if getattr(self.processing_class, "response_schema", None) and not getattr(
+                    parsing_class.tokenizer, "response_schema", None
+                ):
                     parsing_class.tokenizer.response_schema = self.processing_class.response_schema
                 parsing_class = parsing_class.tokenizer
             if (
@@ -1807,14 +1805,11 @@ class GRPOTrainer(_BaseTrainer):
             )
             # Merge tool response images into the images list for the forward pass
             has_tool_images = any(imgs for imgs in tool_images)
-            # DEBUG: tool image collection
             if has_tool_images:
                 if images is None:
                     images = [imgs if imgs else None for imgs in tool_images]
                 else:
-                    images = [
-                        (existing or []) + new for existing, new in zip(images, tool_images, strict=True)
-                    ]
+                    images = [(existing or []) + new for existing, new in zip(images, tool_images, strict=True)]
         else:
             # Support custom env_mask from rollout_func (e.g., for environment feedback masking)
             # Internally treated as tool_mask - marks model tokens (1) vs external tokens (0)
@@ -2084,8 +2079,6 @@ class GRPOTrainer(_BaseTrainer):
                     forward_kwargs["mm_token_type_ids"] = mm_ids
                     num_images = None
 
-            actual_image_tokens = (mm_ids == 1).sum().item()
-
         # When gradient checkpointing is enabled with use_reentrant=True (non default), calling the model inside a
         # torch.no_grad() block triggers a harmless PyTorch warning ("None of the inputs have requires_grad=True").
         # Temporarily disable checkpointing to avoid this warning during inference.
@@ -2252,7 +2245,7 @@ class GRPOTrainer(_BaseTrainer):
             self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
             std_func_rewards = nanstd(rewards_per_func[:, i]).item()
             self._metrics[mode][f"rewards/{reward_func_name}/std"].append(std_func_rewards)
-        rewards = rewards_per_func.nansum(dim=1)
+        rewards = (rewards_per_func * self.reward_weights.to(rewards_per_func.device).unsqueeze(0)).nansum(dim=1)
         self._metrics[mode]["reward"].append(rewards.mean().item())
         self._metrics[mode]["reward_std"].append(rewards.std().item())
         self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
