@@ -1622,11 +1622,10 @@ class GRPOTrainer(_BaseTrainer):
             elif self.use_vllm and self.vllm_mode == "server":
                 max_model_len = self.model.config.max_position_embeddings
             elif not self.use_vllm:
-                max_model_len = getattr(self.model.config, "max_position_embeddings", None)
-                if max_model_len is None:
-                    # Some models (e.g., Qwen3.5) store max length in text_config or use a different attribute
-                    text_config = getattr(self.model.config, "text_config", self.model.config)
-                    max_model_len = getattr(text_config, "max_position_embeddings", 32768)
+                if self._is_vlm:
+                    max_model_len = self.model.config.text_config.max_position_embeddings
+                else:
+                    max_model_len = self.model.config.max_position_embeddings
             else:
                 raise NotImplementedError(
                     f"Unsupported mode detected: use_vllm={self.use_vllm}, vllm_mode={self.vllm_mode}"
