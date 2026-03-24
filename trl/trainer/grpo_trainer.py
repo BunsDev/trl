@@ -318,8 +318,12 @@ class GRPOTrainer(_BaseTrainer):
         # Handle pad token for processors or tokenizers
         if isinstance(processing_class, ProcessorMixin):
             tokenizer = processing_class.tokenizer
+            self._is_vlm = True
+            self._vision_token_ids_cache = None  # populated lazily by _get_vision_token_ids
         elif isinstance(processing_class, PreTrainedTokenizerBase):
             tokenizer = processing_class
+            self._is_vlm = False
+            self._vision_token_ids_cache = None
         else:
             raise TypeError("The `processing_class` must be either a `PreTrainedTokenizerBase` or a `ProcessorMixin`")
 
@@ -1249,7 +1253,7 @@ class GRPOTrainer(_BaseTrainer):
         """Tokenize prompts and extract images/multimodal fields for generation."""
         if is_conversational({"prompt": prompts[0]}):
             # Normalize string content to content blocks for VLM processors that don't handle plain strings.
-            if hasattr(self.processing_class, "image_processor"):
+            if self._is_vlm:
                 for prompt in prompts:
                     self._normalize_message_content(prompt)
 
@@ -1392,7 +1396,7 @@ class GRPOTrainer(_BaseTrainer):
     def _get_tool_suffix_ids(self, tool_messages):
         """Get token IDs for tool result formatting by using a minimal dummy conversation."""
         dummy_messages = [{"role": "user", "content": "dummy"}, {"role": "assistant", "content": "dummy"}]
-        if hasattr(self.processing_class, "image_processor"):
+        if self._is_vlm:
             self._normalize_message_content(dummy_messages)
         prefix_ids = self.processing_class.apply_chat_template(
             dummy_messages,
@@ -1414,7 +1418,7 @@ class GRPOTrainer(_BaseTrainer):
                     if isinstance(part, dict) and part.get("type") == "image":
                         tool_images.append(part["image"])
 
-        if tool_images and hasattr(self.processing_class, "image_processor"):
+        if tool_images and self._is_vlm:
             # For VLMs with images: use processor.__call__ to get correctly expanded image tokens.
             # apply_chat_template only inserts a single <|image_pad|> placeholder per image,
             # but the model needs N tokens per image (based on resolution). The processor's
@@ -1426,12 +1430,14 @@ class GRPOTrainer(_BaseTrainer):
                 chat_template=self.chat_template,
                 **self.chat_template_kwargs,
             )
+            # We only need input_ids (for suffix token extraction). pixel_values and image_grid_thw
+            # are computed separately in the forward pass via image_processor to avoid mismatches.
             full_result = self.processing_class(
                 text=full_text, images=tool_images, return_tensors="pt"
             )
             full_ids = full_result["input_ids"][0].tolist()
         else:
-            if hasattr(self.processing_class, "image_processor"):
+            if self._is_vlm:
                 self._normalize_message_content(tool_messages)
             full_ids = self.processing_class.apply_chat_template(
                 dummy_messages + tool_messages,
@@ -1458,26 +1464,21 @@ class GRPOTrainer(_BaseTrainer):
         """Get vision-related special token IDs from the processor's tokenizer.
 
         Returns a dict with keys 'vision_start', 'vision_end', 'image_pad', 'video_pad'.
-        Values are None if the token doesn't exist in the tokenizer's vocabulary.
-        Works across VLM families (Qwen, Gemma, LLaVA, etc.) by trying common token names.
+        Values are None if the token doesn't exist in the vocabulary.
         """
-        if not hasattr(self, "_vision_token_ids_cache"):
+        if self._vision_token_ids_cache is None:
             cache = {"vision_start": None, "vision_end": None, "image_pad": None, "video_pad": None}
-            if hasattr(self.processing_class, "tokenizer"):
+            if self._is_vlm:
                 tok = self.processing_class.tokenizer
-                # Try common token names across VLM families
-                for name, candidates in {
-                    "vision_start": ["<|vision_start|>", "<|img_start|>"],
-                    "vision_end": ["<|vision_end|>", "<|img_end|>"],
-                    "image_pad": ["<|image_pad|>", "<|image|>", "<image>"],
-                    "video_pad": ["<|video_pad|>"],
+                for name, token_str in {
+                    "vision_start": "<|vision_start|>",
+                    "vision_end": "<|vision_end|>",
+                    "image_pad": "<|image_pad|>",
+                    "video_pad": "<|video_pad|>",
                 }.items():
-                    for candidate in candidates:
-                        tid = tok.convert_tokens_to_ids(candidate)
-                        # convert_tokens_to_ids returns the unk_token_id for unknown tokens
-                        if tid != tok.unk_token_id:
-                            cache[name] = tid
-                            break
+                    tid = tok.convert_tokens_to_ids(token_str)
+                    if tid != tok.unk_token_id:
+                        cache[name] = tid
             self._vision_token_ids_cache = cache
         return self._vision_token_ids_cache
 
@@ -1697,7 +1698,7 @@ class GRPOTrainer(_BaseTrainer):
 
             # Decode post-tool completions. Use tokenizer for parsing (processors don't have parse_response).
             parsing_class = self.processing_class
-            if not isinstance(parsing_class, PreTrainedTokenizerBase) and hasattr(parsing_class, "tokenizer"):
+            if self._is_vlm:
                 parsing_class = parsing_class.tokenizer
             post_tool_completions = [
                 parse_response(parsing_class, ids) if ids else {} for ids in post_tool_ids
@@ -1773,7 +1774,7 @@ class GRPOTrainer(_BaseTrainer):
         # For VLM processors, delegate to the inner tokenizer for parsing (parse_response lives on the tokenizer).
         if is_conversational({"prompt": prompts[0]}):
             parsing_class = self.processing_class
-            if not isinstance(parsing_class, PreTrainedTokenizerBase) and hasattr(parsing_class, "tokenizer"):
+            if self._is_vlm:
                 # Propagate response_schema from processor to tokenizer if needed
                 if getattr(self.processing_class, "response_schema", None) and not getattr(parsing_class.tokenizer, "response_schema", None):
                     parsing_class.tokenizer.response_schema = self.processing_class.response_schema
@@ -1987,7 +1988,7 @@ class GRPOTrainer(_BaseTrainer):
         num_images = [len(img_list) if img_list else 0 for img_list in images] if images is not None else None
 
         # Get forward_kwargs for models with multimodal inputs
-        if images is not None and hasattr(self.processing_class, "image_processor"):
+        if images is not None and self._is_vlm:
             # For VLMs with tool images: process images through image_processor and construct
             # mm_token_type_ids from prompt_completion_ids by detecting image/video pad tokens.
             flat_images = [img for img_list in images if img_list for img in img_list]
