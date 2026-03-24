@@ -45,7 +45,6 @@ python examples/scripts/openenv/carla_vlm.py \
 
 import argparse
 import base64
-import os
 from io import BytesIO
 
 from carla_env import CarlaAction, CarlaEnv

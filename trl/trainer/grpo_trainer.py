@@ -1415,11 +1415,15 @@ class GRPOTrainer(_BaseTrainer):
                     if isinstance(part, dict) and part.get("type") == "image":
                         tool_images.append(part["image"])
 
-        # Normalize string content in tool messages for VLM processors before either path
+        # Normalize string content in tool messages for VLM processors before either path.
+        # Use copies to avoid mutating the original completions data.
         if self._is_vlm:
-            for msg in tool_messages:
-                if isinstance(msg.get("content"), str):
-                    msg["content"] = [{"type": "text", "text": msg["content"]}]
+            tool_messages = [
+                {**msg, "content": [{"type": "text", "text": msg["content"]}]}
+                if isinstance(msg.get("content"), str)
+                else msg
+                for msg in tool_messages
+            ]
 
         if tool_images and self._is_vlm:
             # For VLMs with images: use processor.__call__ to get correctly expanded image tokens.
