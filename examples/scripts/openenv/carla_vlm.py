@@ -54,6 +54,9 @@ from PIL import Image
 
 from trl import GRPOConfig, GRPOTrainer
 
+# Enable logging in a Hugging Face Space
+os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run GRPO VLM training with CARLA environment.")
@@ -197,8 +200,6 @@ Observe the scene first, then decide the best course of action to minimize harm.
             result = self._advance_and_capture()
             self.reward = result.observation.rubric_reward or 0.0
             return self._format_multimodal(result.observation)
-
-    os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
 
     trainer = GRPOTrainer(
         model=args.model,
