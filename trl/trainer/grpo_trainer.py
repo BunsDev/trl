@@ -1439,9 +1439,9 @@ class GRPOTrainer(_BaseTrainer):
             )
             # We only need input_ids (for suffix token extraction). pixel_values and image_grid_thw
             # are computed separately in the forward pass via image_processor to avoid mismatches.
-            full_ids = self.processing_class(text=full_text, images=tool_images, return_tensors="pt")[
-                "input_ids"
-            ][0].tolist()
+            full_ids = self.processing_class(text=full_text, images=tool_images, return_tensors="pt")["input_ids"][
+                0
+            ].tolist()
         else:
             if self._is_vlm:
                 for msg in tool_messages:
