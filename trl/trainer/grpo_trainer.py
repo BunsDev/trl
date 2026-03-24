@@ -1415,6 +1415,12 @@ class GRPOTrainer(_BaseTrainer):
                     if isinstance(part, dict) and part.get("type") == "image":
                         tool_images.append(part["image"])
 
+        # Normalize string content in tool messages for VLM processors before either path
+        if self._is_vlm:
+            for msg in tool_messages:
+                if isinstance(msg.get("content"), str):
+                    msg["content"] = [{"type": "text", "text": msg["content"]}]
+
         if tool_images and self._is_vlm:
             # For VLMs with images: use processor.__call__ to get correctly expanded image tokens.
             # apply_chat_template only inserts a single <|image_pad|> placeholder per image,
@@ -1443,10 +1449,6 @@ class GRPOTrainer(_BaseTrainer):
                 0
             ].tolist()
         else:
-            if self._is_vlm:
-                for msg in tool_messages:
-                    if isinstance(msg.get("content"), str):
-                        msg["content"] = [{"type": "text", "text": msg["content"]}]
             full_ids = self.processing_class.apply_chat_template(
                 dummy_messages + tool_messages,
                 add_generation_prompt=True,
