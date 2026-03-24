@@ -1641,8 +1641,17 @@ class GRPOTrainer(_BaseTrainer):
             if not idxs_with_tool:
                 break  # all overlong, exit tool loop
 
-            # Filter images and multimodal fields to match the current subset (index into full batch)
-            loop_images = [images[i] for i in idxs_with_tool] if images else None
+            # Filter images and multimodal fields to match the current subset (index into full batch).
+            # Merge tool response images so the model can see visual feedback during generation.
+            merged_images = images
+            if any(imgs for imgs in tool_images):
+                if merged_images is None:
+                    merged_images = [imgs if imgs else None for imgs in tool_images]
+                else:
+                    merged_images = [
+                        (existing or []) + new for existing, new in zip(merged_images, tool_images, strict=True)
+                    ]
+            loop_images = [merged_images[i] for i in idxs_with_tool] if merged_images else None
             loop_multimodal_fields = (
                 {k: [v[i] for i in idxs_with_tool] for k, v in multimodal_fields.items()} if multimodal_fields else {}
             )
