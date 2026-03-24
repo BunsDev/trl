@@ -45,6 +45,7 @@ python examples/scripts/openenv/carla_vlm.py \
 
 import argparse
 import base64
+import os
 from io import BytesIO
 
 from carla_env import CarlaAction, CarlaEnv
@@ -69,7 +70,6 @@ def parse_args():
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
     parser.add_argument("--max-steps", type=int, default=100)
     parser.add_argument("--image-size", type=int, default=512, help="Resize camera images to this size. 0 to disable.")
-    parser.add_argument("--trackio-space-id", type=str, default="carla-vlm-grpo")
     parser.add_argument("--hub-model-id", type=str, default=None)
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--report-to", type=str, default="trackio", help="Logging backend: wandb, trackio, none.")
@@ -197,6 +197,8 @@ Observe the scene first, then decide the best course of action to minimize harm.
             result = self._advance_and_capture()
             self.reward = result.observation.rubric_reward or 0.0
             return self._format_multimodal(result.observation)
+
+    os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
 
     trainer = GRPOTrainer(
         model=args.model,
