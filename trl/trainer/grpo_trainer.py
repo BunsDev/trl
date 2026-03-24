@@ -1420,6 +1420,16 @@ class GRPOTrainer(_BaseTrainer):
             # apply_chat_template only inserts a single <|image_pad|> placeholder per image,
             # but the model needs N tokens per image (based on resolution). The processor's
             # __call__ handles this expansion.
+            # Use the same tokenization method (processor.__call__) for both prefix and full to
+            # avoid mismatches from different tokenization paths.
+            prefix_text = self.processing_class.apply_chat_template(
+                dummy_messages,
+                add_generation_prompt=False,
+                tokenize=False,
+                chat_template=self.chat_template,
+                **self.chat_template_kwargs,
+            )
+            prefix_ids = self.processing_class(text=prefix_text, return_tensors="pt")["input_ids"][0].tolist()
             full_text = self.processing_class.apply_chat_template(
                 dummy_messages + tool_messages,
                 add_generation_prompt=True,
@@ -1429,8 +1439,9 @@ class GRPOTrainer(_BaseTrainer):
             )
             # We only need input_ids (for suffix token extraction). pixel_values and image_grid_thw
             # are computed separately in the forward pass via image_processor to avoid mismatches.
-            full_result = self.processing_class(text=full_text, images=tool_images, return_tensors="pt")
-            full_ids = full_result["input_ids"][0].tolist()
+            full_ids = self.processing_class(text=full_text, images=tool_images, return_tensors="pt")[
+                "input_ids"
+            ][0].tolist()
         else:
             if self._is_vlm:
                 for msg in tool_messages:
