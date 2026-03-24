@@ -101,9 +101,7 @@ You have the following tools available:
 
 Observe the scene first, then decide the best course of action to minimize harm."""
 
-    dataset = Dataset.from_dict(
-        {"prompt": [[{"role": "user", "content": prompt}] for _ in range(args.dataset_size)]}
-    )
+    dataset = Dataset.from_dict({"prompt": [[{"role": "user", "content": prompt}] for _ in range(args.dataset_size)]})
 
     class CarlaVLMEnv:
         def __init__(self):
