@@ -1760,6 +1760,8 @@ class GRPOTrainer(_BaseTrainer):
                 raise ValueError(f"rollout_func must return keys {missing_keys_list} in its output dict.")
             extra_fields = {k: v for k, v in output.items() if k not in required_keys}
             prompt_ids, completion_ids, logprobs = output["prompt_ids"], output["completion_ids"], output["logprobs"]
+            images = None
+            multimodal_fields = {}
         else:
             prompt_ids, images, multimodal_fields = self._tokenize_prompts(prompts)
             completion_ids, logprobs = self._generate_single_turn(prompt_ids, images, multimodal_fields)
