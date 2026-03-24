@@ -72,7 +72,7 @@ def parse_args():
     parser.add_argument("--trackio-space-id", type=str, default="carla-vlm-grpo")
     parser.add_argument("--hub-model-id", type=str, default=None)
     parser.add_argument("--run-name", type=str, default=None)
-    parser.add_argument("--report-to", type=str, default="wandb", help="Logging backend: wandb, trackio, none.")
+    parser.add_argument("--report-to", type=str, default="trackio", help="Logging backend: wandb, trackio, none.")
     return parser.parse_args()
 
 

@@ -1242,20 +1242,15 @@ class GRPOTrainer(_BaseTrainer):
         rewards_per_func = gather(rewards_per_func)
         return rewards_per_func
 
-    @staticmethod
-    def _normalize_message_content(messages):
-        """Normalize string content to content blocks in-place for VLM processor compatibility."""
-        for message in messages:
-            if isinstance(message.get("content"), str):
-                message["content"] = [{"type": "text", "text": message["content"]}]
-
     def _tokenize_prompts(self, prompts: list):
         """Tokenize prompts and extract images/multimodal fields for generation."""
         if is_conversational({"prompt": prompts[0]}):
             # Normalize string content to content blocks for VLM processors that don't handle plain strings.
             if self._is_vlm:
                 for prompt in prompts:
-                    self._normalize_message_content(prompt)
+                    for message in prompt:
+                        if isinstance(message.get("content"), str):
+                            message["content"] = [{"type": "text", "text": message["content"]}]
 
             # Extract images from messages for VLM support
             images = []
@@ -1397,7 +1392,9 @@ class GRPOTrainer(_BaseTrainer):
         """Get token IDs for tool result formatting by using a minimal dummy conversation."""
         dummy_messages = [{"role": "user", "content": "dummy"}, {"role": "assistant", "content": "dummy"}]
         if self._is_vlm:
-            self._normalize_message_content(dummy_messages)
+            for message in dummy_messages:
+                if isinstance(message.get("content"), str):
+                    message["content"] = [{"type": "text", "text": message["content"]}]
         prefix_ids = self.processing_class.apply_chat_template(
             dummy_messages,
             add_generation_prompt=False,
@@ -1436,7 +1433,9 @@ class GRPOTrainer(_BaseTrainer):
             full_ids = full_result["input_ids"][0].tolist()
         else:
             if self._is_vlm:
-                self._normalize_message_content(tool_messages)
+                for msg in tool_messages:
+                    if isinstance(msg.get("content"), str):
+                        msg["content"] = [{"type": "text", "text": msg["content"]}]
             full_ids = self.processing_class.apply_chat_template(
                 dummy_messages + tool_messages,
                 add_generation_prompt=True,
