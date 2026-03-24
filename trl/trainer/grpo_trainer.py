@@ -1941,6 +1941,7 @@ class GRPOTrainer(_BaseTrainer):
                 for prompt, image_list in zip(prompts, images, strict=True)
             ]
 
+        dataset_images = images  # preserve dataset images before _generate may overwrite
         (
             prompt_ids_list,
             completion_ids_list,
@@ -1951,6 +1952,8 @@ class GRPOTrainer(_BaseTrainer):
             extra_fields,
             images,
         ) = self._generate(prompts)
+        if images is None:
+            images = dataset_images  # restore dataset images (rollout_func path returns None)
 
         # Convert lists of token IDs to padded tensors
         prompt_ids = [torch.tensor(ids) for ids in prompt_ids_list]
