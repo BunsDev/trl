@@ -1497,6 +1497,7 @@ class GRPOTrainer(_BaseTrainer):
         backs up to the end of the last complete image. This prevents mismatches between
         image placeholder tokens in input_ids and pixel_values in the forward pass.
         """
+        max_length = max(max_length, 0)
         if len(ids) <= max_length:
             return ids
 
