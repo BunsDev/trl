@@ -54,9 +54,6 @@ from PIL import Image
 
 from trl import GRPOConfig, GRPOTrainer
 
-# Enable logging in a Hugging Face Space
-os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run GRPO VLM training with CARLA environment.")
@@ -73,6 +70,7 @@ def parse_args():
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
     parser.add_argument("--max-steps", type=int, default=100)
     parser.add_argument("--image-size", type=int, default=512, help="Resize camera images to this size. 0 to disable.")
+    parser.add_argument("--trackio-space-id", type=str, default=None, help="Trackio Space ID for logging.")
     parser.add_argument("--hub-model-id", type=str, default=None)
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--report-to", type=str, default="trackio", help="Logging backend: wandb, trackio, none.")
@@ -220,6 +218,7 @@ Observe the scene first, then decide the best course of action to minimize harm.
             hub_model_id=args.hub_model_id,
             run_name=args.run_name,
             report_to=args.report_to,
+            trackio_space_id=args.trackio_space_id,
         ),
         environment_factory=CarlaVLMEnv,
     )
