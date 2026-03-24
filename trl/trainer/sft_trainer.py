@@ -108,6 +108,12 @@ class DataCollatorForLanguageModeling(DataCollatorMixin):
     Args:
         pad_token_id (`int`):
             Token ID to use for padding.
+        max_length (`int`, *optional*):
+            Maximum length of the sequences in the batch. Sequences longer than `max_length` are truncated to
+            `max_length`.
+        truncation_mode (`str`, *optional*, defaults to `"keep_start"`):
+            Truncation mode to use when the sequence exceeds `max_length`. Possible values are `"keep_end"` and
+            `"keep_start"`.
         completion_only_loss (`bool`, *optional*, defaults to `True`):
             When the input contains a completion mask (`completion_mask`), the labels are set to -100 for the tokens
             that are no in the completion.
@@ -156,6 +162,8 @@ class DataCollatorForLanguageModeling(DataCollatorMixin):
     """
 
     pad_token_id: int
+    max_length: int | None = None
+    truncation_mode: str = "keep_start"
     completion_only_loss: bool = True
     padding_free: bool = False
     pad_to_multiple_of: int | None = None
@@ -164,26 +172,42 @@ class DataCollatorForLanguageModeling(DataCollatorMixin):
     def torch_call(self, examples: list[dict[str, Any]]) -> dict[str, Any]:
         # Convert to tensor
         input_ids = [torch.tensor(example["input_ids"]) for example in examples]
+        batch_seq_lengths = [example["seq_lengths"] for example in examples] if "seq_lengths" in examples[0] else None
         if "labels" in examples[0]:
             labels = [torch.tensor(example["labels"]) for example in examples]
         else:
             labels = [torch.tensor(example["input_ids"]) for example in examples]
-
-        # For padding-free, we should NOT create attention_mask as it causes FlashAttention to ignore position_ids and
-        # compute wrong cu_seq_lens from the all-1s mask
-        if self.padding_free:
-            if "seq_lengths" in examples[0]:
-                position_ids = self.get_position_ids_from_packed_seq_lengths(
-                    [example["seq_lengths"] for example in examples]
-                )
-            else:
-                position_ids = [torch.arange(len(ids)) for ids in input_ids]
-        else:
-            attention_mask = [torch.ones_like(ids) for ids in input_ids]
         if self.completion_only_loss and "completion_mask" in examples[0]:
             completion_mask = [torch.tensor(example["completion_mask"]) for example in examples]
         if "assistant_masks" in examples[0]:
             assistant_masks = [torch.tensor(example["assistant_masks"]) for example in examples]
+
+        # Truncate per sequence if necessary
+        if self.max_length is not None and not self.padding_free:
+            if self.truncation_mode == "keep_start":
+                sl = slice(None, self.max_length)
+            elif self.truncation_mode == "keep_end":
+                sl = slice(-self.max_length, None)
+            else:
+                raise ValueError(
+                    f"Unsupported truncation mode: {self.truncation_mode}, expected 'keep_start' or 'keep_end'"
+                )
+            input_ids = [ids[sl] for ids in input_ids]
+            labels = [lbl[sl] for lbl in labels]
+            if self.completion_only_loss and "completion_mask" in examples[0]:
+                completion_mask = [m[sl] for m in completion_mask]
+            if "assistant_masks" in examples[0]:
+                assistant_masks = [m[sl] for m in assistant_masks]
+
+        # For padding-free, we should NOT create attention_mask as it causes FlashAttention to ignore position_ids and
+        # compute wrong cu_seq_lens from the all-1s mask
+        if self.padding_free:
+            if batch_seq_lengths is not None:
+                position_ids = self.get_position_ids_from_packed_seq_lengths(batch_seq_lengths)
+            else:
+                position_ids = [torch.arange(len(ids)) for ids in input_ids]
+        else:
+            attention_mask = [torch.ones_like(ids) for ids in input_ids]
 
         # If padding_free, flatten everything into a single sequence
         output = {}
@@ -714,6 +738,13 @@ class SFTTrainer(_BaseTrainer):
                 "Assistant-only loss is not yet supported for vision-language models. Please set "
                 "`assistant_only_loss=False` in the `SFTConfig`."
             )
+        if self._is_vlm and args.max_length is not None and args.truncation_mode == "keep_end":
+            raise ValueError(
+                "truncation_mode='keep_end' is not supported for vision-language models. Image tokens reside "
+                "inside the prompt portion of the sequence; depending on the example, keep_end may silently "
+                "drop them, causing pixel_values to be forwarded to the model with no corresponding visual "
+                "tokens in input_ids. Use truncation_mode='keep_start' (the default) or set max_length=None."
+            )
 
         # PEFT configuration and model wrapping
         if peft_config is not None:
@@ -795,7 +826,7 @@ class SFTTrainer(_BaseTrainer):
         # Data collator
         # BFD packing requires padding-free mode; otherwise, the collator outputs padded attention masks, causing
         # FlashAttention to ignore position_ids and recompute them incorrectly from the padded attention mask.
-        self.padding_free = args.padding_free or (args.packing and args.packing_strategy == "bfd")
+        self.padding_free = args.padding_free or (args.packing and args.packing_strategy in {"bfd", "bfd_split"})
         use_flash_attention = model.config._attn_implementation in FLASH_ATTENTION_VARIANTS
         if self.padding_free:
             if data_collator is not None:
@@ -851,6 +882,8 @@ class SFTTrainer(_BaseTrainer):
                 )
             data_collator = DataCollatorForLanguageModeling(
                 pad_token_id=pad_token_id,
+                max_length=None if self.padding_free else args.max_length,
+                truncation_mode=args.truncation_mode,
                 completion_only_loss=self.completion_only_loss,
                 padding_free=self.padding_free,
                 pad_to_multiple_of=args.pad_to_multiple_of,
@@ -864,7 +897,7 @@ class SFTTrainer(_BaseTrainer):
                 dataset_text_field=args.dataset_text_field,
             )
 
-        if args.packing and args.packing_strategy == "bfd" and not use_flash_attention:
+        if args.packing and args.packing_strategy in {"bfd", "bfd_split"} and not use_flash_attention:
             logger.warning(
                 "You are using packing, but the attention implementation is not set to a supported flash attention "
                 "variant. Packing gathers multiple samples into a single sequence, and only the following "
@@ -887,6 +920,12 @@ class SFTTrainer(_BaseTrainer):
             and args.dataset_kwargs.get("skip_prepare_dataset", False)
             or self._is_vision_dataset
         )
+        if skip_prepare_dataset and self.padding_free and args.max_length is not None and not self._is_vision_dataset:
+            raise ValueError(
+                "When `padding_free=True`, `max_length` must be enforced during dataset preparation or packing, not in "
+                "the collator. Disable `skip_prepare_dataset`, provide already packed/truncated inputs, or set "
+                "`max_length=None`."
+            )
         if not skip_prepare_dataset:
             if self.completion_only_loss and formatting_func:
                 raise ValueError(
@@ -1174,7 +1213,9 @@ class SFTTrainer(_BaseTrainer):
             elif args.max_length is not None:
                 if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
                     map_kwargs["desc"] = f"Truncating {dataset_name} dataset"
-                dataset = truncate_dataset(dataset, args.max_length, map_kwargs)
+                dataset = truncate_dataset(
+                    dataset, args.max_length, truncation_mode=args.truncation_mode, map_kwargs=map_kwargs
+                )
             # For Liger kernel, ensure only the essential columns
             if args.use_liger_kernel:
                 collator_expected_keys = {"input_ids", "seq_lengths", "completion_mask", "assistant_masks"}

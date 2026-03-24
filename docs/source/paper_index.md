@@ -165,6 +165,24 @@ trainer = GRPOTrainer(
 )
 ```
 
+### INTELLECT-2: A Reasoning Model Trained Through Globally Decentralized Reinforcement Learning
+
+**📜 Paper**: https://huggingface.co/papers/2505.07291
+
+INTELLECT-2 is the first globally distributed reinforcement learning training run of a 32 billion parameter language model using fully asynchronous RL across a dynamic, heterogeneous swarm of permissionless compute contributors. The authors propose modifications to the standard GRPO training recipe, including two-sided GRPO clipping for increased training stability. To reproduce the paper's setting, use this configuration:
+
+```python
+from trl import GRPOConfig
+
+training_args = GRPOConfig(
+    delta=4,  # δ in section 4.1 of the paper
+    epsilon=0.2,  # ε in section 4.1 of the paper
+    beta=0.001,  # KL divergence coefficient in section 4.1 of the paper
+    num_generations=16,  # responses per prompt in section 4.1 of the paper
+    learning_rate=3e-7,  # section 4.1 of the paper
+)
+```
+
 ### Beyond the 80/20 Rule: High-Entropy Minority Tokens Drive Effective Reinforcement Learning for LLM Reasoning
 
 **📜 Paper**: https://huggingface.co/papers/2506.01939
@@ -433,6 +451,25 @@ training_args = GRPOConfig(
 )
 ```
 
+### It Takes Two: Your GRPO Is Secretly DPO
+
+**📜 Paper**: https://huggingface.co/papers/2510.00977
+
+Shows that GRPO's effectiveness stems from an implicit contrastive objective rather than accurate advantage estimation via large group sizes. This establishes a formal connection between GRPO and DPO, where group size only affects Monte Carlo estimators of the contrastive objective. The authors introduce 2-GRPO — using just two rollouts — which matches the performance of 16-GRPO at significantly lower training cost. Used in TRL via [`GRPOTrainer`] with `num_generations=2`. To reproduce the paper's setting, use this configuration:
+
+```python
+from trl import GRPOConfig, GRPOTrainer
+
+training_args = GRPOConfig(
+    num_generations=2,  # minimal two-rollout case (2-GRPO) from the paper
+    loss_type="grpo",
+)
+trainer = GRPOTrainer(
+    ...,
+    args=training_args,
+)
+```
+
 ### Soft Adaptive Policy Optimization
 
 **📜 Paper**: https://huggingface.co/papers/2511.20347
@@ -573,23 +610,63 @@ training_args = GRPOConfig(
 )
 ```
 
-### INTELLECT-2: A Reasoning Model Trained Through Globally Decentralized Reinforcement Learning
+### VESPO: Variational Sequence-Level Soft Policy Optimization for Stable Off-Policy LLM Training
 
-**📜 Paper**: https://huggingface.co/papers/2505.07291
+**📜 Paper**: https://huggingface.co/papers/2602.10693
 
-INTELLECT-2 is the first globally distributed reinforcement learning training run of a 32 billion parameter language model using fully asynchronous RL across a dynamic, heterogeneous swarm of permissionless compute contributors. The authors propose modifications to the standard GRPO training recipe, including two-sided GRPO clipping for increased training stability. To reproduce the paper's setting, use this configuration:
+VESPO addresses training instability in off-policy RL caused by policy staleness, asynchronous updates, and train-inference mismatches. Rather than relying on heuristic token-level clipping (GRPO) or sequence-length normalization (GSPO), VESPO derives a principled reshaping kernel from a variational framework. In practice, this yields a smooth, asymmetric Gamma weighting function that gracefully suppresses extreme sequence-level importance weights without introducing length bias.
+
+$$
+\mathcal{L}_{\text{VESPO}}(\theta) = - \mathbb{E}_{\tau \sim \mu} \left[ \underbrace{W(\tau)^{k} \cdot \exp\left(\lambda
+(1 - W(\tau))\right)}_{\phi(W) \text{ detached }} \cdot \mathcal{A}(\tau) \cdot \log \pi_\theta(\tau) \right]
+$$
+
+with  \\( W(\tau) = \frac{\pi_\theta(\tau)}{\mu(\tau)} \\) the sequence level importance ratio, and  \\( \phi(W) \\) is detached from the computation graph to serve as a gradient scaling coefficient.
 
 ```python
 from trl import GRPOConfig
 
 training_args = GRPOConfig(
-    delta=4,  # δ in section 4.1 of the paper
-    epsilon=0.2,  # ε in section 4.1 of the paper
-    beta=0.001,  # KL divergence coefficient in section 4.1 of the paper
-    num_generations=16,  # responses per prompt in section 4.1 of the paper
-    learning_rate=3e-7,  # section 4.1 of the paper
+    loss_type="vespo",
+    use_vllm=True,  # or False if not using any token-level `vllm_importance_sampling_correction` methods
+    vllm_importance_sampling_mode="token_truncate",  # default correction mode for VESPO, `token_mask` also supported
+    vespo_k_pos=2.0,  # power exponent (c1 in paper Section 3.4) for positive advantages
+    vespo_lambda_pos=3.0,  # decay factor (c2 in paper Section 3.4) for positive advantages
+    vespo_k_neg=3.0,  # power exponent (c1 in paper Section 3.4) for negative advantages
+    vespo_lambda_neg=2.0,  # decay factor (c2 in paper Section 3.4) for negative advantages
 )
 ```
+
+
+### Rethinking the Trust Region in LLM Reinforcement Learning
+
+**📜 Paper**: https://huggingface.co/papers/2602.04879
+
+DPPO replaces PPO/GRPO's heuristic ratio-clipping with a principled trust region based on direct policy divergence estimates. PPO-style clipping masks tokens based on the probability ratio π/μ, which over-penalizes low-probability tokens and under-penalizes high-probability ones. DPPO instead masks based on direct approximations of policy divergence (TV or KL), ensuring updates stay within a theoretically grounded trust region. Four divergence approximations are supported: `binary_tv`, `binary_kl`, `topk_tv`, and `topk_kl`.
+
+```python
+from trl.experimental.dppo import DPPOConfig, DPPOTrainer
+
+training_args = DPPOConfig(
+    divergence_type="binary_tv",  # divergence approximation
+    divergence_topk=20,  # K for top-K divergence modes (Section 7 / Appendix G.2 of the paper)
+    epsilon=0.15,  # δ_low threshold (Appendix F of the paper)
+    epsilon_high=0.15,  # δ_high threshold (Appendix F of the paper)
+    clip_ratio_c=20.0,  # IS ratio upper bound C (Section 5.4 of the paper)
+    beta=0.0,  # KL regularization coefficient
+    use_vllm=True,
+)
+
+trainer = DPPOTrainer(
+    model="your-model",
+    reward_funcs=[...],
+    args=training_args,
+    train_dataset=dataset,
+)
+trainer.train()
+```
+
+The official code [sail-sg/Stable-RL](https://github.com/sail-sg/Stable-RL)
 
 ## Direct Policy Optimization
 
@@ -1140,6 +1217,22 @@ SFTConfig(
 )
 ```
 
+### Fewer Truncations Improve Language Modeling
+
+**📜 Paper**: https://huggingface.co/papers/2404.10830
+
+The paper shows that the standard concatenate-then-split preprocessing (`packing_strategy="wrapped"`) used for LLM training causes many documents to be arbitrarily truncated, which harms learning. It proposes packing document chunks into context windows using a Best-Fit Decreasing bin-packing algorithm, greatly reducing truncation while keeping high token utilization and improving model performance. TRL implements this as the `"bfd_split"` packing strategy in [`SFTConfig`]. For more details on packing, see the [SFT documentation](sft_trainer#packing).
+
+```python
+from trl import SFTConfig
+
+training_args = SFTConfig(
+    packing=True,
+    packing_strategy="bfd_split",
+    max_length=4096,
+)
+```
+
 ### Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer
 
 **📜 Paper**: https://huggingface.co/papers/1910.10683
@@ -1555,6 +1648,84 @@ trainer.train()
 ```
 
 For more details, see the [MiniLLM Trainer documentation](minillm) documentation.
+
+### Reinforcement Learning via Self-Distillation
+
+**📜 Paper**: https://huggingface.co/papers/2601.20802
+
+Self-Distillation Policy Optimization (SDPO) enhances reinforcement learning with verifiable rewards by converting rich textual feedback (e.g., runtime errors, judge evaluations) into a dense learning signal without any external teacher or explicit reward model. SDPO treats the current model conditioned on feedback as a self-teacher and distills its feedback-informed next-token predictions back into the policy. Notably, SDPO also outperforms baselines in standard RLVR environments that only return scalar feedback by using successful rollouts as implicit feedback for failed attempts.
+
+```python
+from trl.experimental.sdpo import SDPOConfig, SDPOTrainer
+
+training_args = SDPOConfig(
+    distillation_alpha=0.5,                # Jensen-Shannon divergence (recommended)
+    distillation_topk=100,                 # Top-K logit distillation approximation
+    full_logit_distillation=True,          # Required for top-K logit-level SDPO
+    distillation_is_clip=2.0,              # Importance sampling clipping
+    distillation_weight=1.0,               # Weight for self-distillation loss
+    sdpo_policy_loss_mode="distillation_only",
+    use_successful_as_teacher=True,        # Use successful rollouts as teacher
+    teacher_regularization="ema",          # Supported: "ema", "none"
+    teacher_update_rate=0.05,              # EMA update rate
+    include_environment_feedback=False,    # Use dataset privileged_context when available
+)
+
+trainer = SDPOTrainer(
+    model="Qwen/Qwen2.5-1.5B-Instruct",
+    reward_funcs=...,
+    args=training_args,
+    train_dataset=...,
+)
+trainer.train()
+```
+
+Expected dataset columns:
+
+- `prompt`
+- `privileged_context` for optional environment feedback
+
+For more details, see the [SDPO Trainer documentation](sdpo_trainer).
+
+### Self-Training with On-Policy Self-Distillation for Language Model Alignment
+
+**📜 Paper**: https://huggingface.co/papers/2601.19897
+
+Self-Distilled Fine-Tuning (SDFT) performs on-policy self-distillation by generating completions during training, then distilling an explicit teacher-conditioned view of those same completions back into the student. In TRL, SDFT uses a shared self-distillation core with SDPO where the teacher is the model itself (base weights with adapter disabled for PEFT, or the same model under `no_grad` for non-PEFT).
+The teacher prompt is composed internally from the student `prompt` plus the dataset `privileged_context`.
+
+```python
+from datasets import Dataset
+
+from trl.experimental.sdft import SDFTConfig, SDFTTrainer
+
+dataset = Dataset.from_dict(
+    {
+        "prompt": [[{"role": "user", "content": "Solve 2+2."}]],
+        "privileged_context": ["Example answer: 4."],
+    }
+)
+
+training_args = SDFTConfig(
+    distillation_alpha=0.5,
+    distillation_topk=5,
+    max_completion_length=64,
+)
+
+trainer = SDFTTrainer(
+    model="Qwen/Qwen2.5-1.5B-Instruct",
+    args=training_args,
+    train_dataset=dataset,
+)
+trainer.train()
+```
+
+Expected dataset columns:
+
+- `prompt`
+- `privileged_context` containing only the extra teacher-only information
+
+For more details, see the [SDFT Trainer documentation](sdft_trainer).
 
 ## Distributed Training
 
