@@ -67,7 +67,7 @@ def parse_args():
     parser.add_argument("--dataset-size", type=int, default=1000)
     parser.add_argument("--max-completion-length", type=int, default=2048)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
-    parser.add_argument("--max-steps", type=int, default=50)
+    parser.add_argument("--max-steps", type=int, default=100)
     parser.add_argument("--image-size", type=int, default=512, help="Resize camera images to this size. 0 to disable.")
     parser.add_argument("--trackio-space-id", type=str, default="carla-vlm-grpo")
     parser.add_argument("--hub-model-id", type=str, default=None)
