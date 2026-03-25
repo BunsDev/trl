@@ -1479,7 +1479,7 @@ class RLOOTrainer(_BaseTrainer):
             table = {
                 "step": [str(self.state.global_step)] * len(self._logs["prompt"]),
                 "prompt": [_strip_images_from_messages(p) for p in self._logs["prompt"]],
-                "completion": self._logs["completion"],
+                "completion": [_strip_images_from_messages(c) for c in self._logs["completion"]],
                 **self._logs["rewards"],
                 **self._logs["extra"],
                 "advantage": self._logs["advantages"],
