@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 
-from trl.experimental.chunk_lm_head import _ChunkedLogProbFunction, patch_chunked_lm_head
+from trl.trainer.utils import _ChunkedLogProbFunction, patch_chunked_lm_head
 
 
 N, H, V = 64, 32, 128

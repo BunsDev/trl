@@ -30,9 +30,8 @@ from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase, TrainerCallback
 from transformers.data.data_collator import DataCollatorMixin
 
-from trl.experimental.chunk_lm_head import patch_chunked_lm_head
 from trl.trainer.base_trainer import _BaseTrainer
-from trl.trainer.utils import pad, selective_log_softmax
+from trl.trainer.utils import pad, patch_chunked_lm_head
 
 from .async_grpo_config import AsyncGRPOConfig
 from .async_rollout_worker import AsyncRolloutWorker
@@ -293,21 +292,10 @@ class AsyncGRPOTrainer(_BaseTrainer):
         model_name = model
         model = AutoModelForCausalLM.from_pretrained(model, device_map=None, dtype=torch.float32)
 
-        if self.args.chunk_lm_head_size is not None and self.args.use_liger_kernel:
-            raise ValueError(
-                "`chunk_lm_head_size` and `use_liger_kernel` cannot both be set. "
-                "Both optimize the LM head forward pass to avoid materializing full logits; pick one."
-            )
+        if self.args.use_liger_kernel:
+            raise NotImplementedError("`use_liger_kernel` is not supported yet.")
 
-        if self.args.chunk_lm_head_size is not None:
-            if getattr(model.config, "final_logit_softcapping", None) is not None:
-                logger.warning(
-                    "Model has `final_logit_softcapping` which is not supported "
-                    "by chunked LM head. Disabling `chunk_lm_head_size`."
-                )
-                self.args.chunk_lm_head_size = None
-            else:
-                patch_chunked_lm_head(model, self.args.chunk_lm_head_size, self.temperature)
+        patch_chunked_lm_head(model, chunk_size=8192, temperature=self.temperature)
 
         # Processing class
         if processing_class is None:
@@ -462,24 +450,14 @@ class AsyncGRPOTrainer(_BaseTrainer):
         old_log_probs = old_log_probs[:, :local_max_len]
 
         forward_start = time.time()
-        use_chunked = self.args.chunk_lm_head_size is not None
-
-        logits, entropy = None, None
-        if use_chunked:
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=input_ids,
-                completion_mask=completion_mask,
-                use_cache=False,
-            )
-            log_probs = outputs["log_probs"]
-            entropy = outputs["entropy"]
-        else:
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-            logits = outputs.logits[:, :-1, :]
-            logits.div_(self.temperature)
-            log_probs = selective_log_softmax(logits, input_ids[:, 1:])
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=input_ids,
+            completion_mask=completion_mask,
+            use_cache=False,
+        )
+        log_probs, entropy = outputs["log_probs"], outputs["entropy"]
         self._last_forward_time_s = time.time() - forward_start
 
         completion_mask = completion_mask[:, 1:]
@@ -516,13 +494,6 @@ class AsyncGRPOTrainer(_BaseTrainer):
                 else torch.zeros((), device=completion_mask.device)
             )
 
-            if not use_chunked:
-                assert logits is not None, "Logits are only computed on non-chunked forward"
-                probs = torch.softmax(logits, dim=-1)
-                log_p = torch.log_softmax(logits, dim=-1)
-                entropy = -torch.sum(probs * log_p, dim=-1)
-
-            assert entropy is not None
             local_entropy_sum = (
                 entropy[valid_mask].sum() if valid_mask.any() else torch.zeros((), device=completion_mask.device)
             )

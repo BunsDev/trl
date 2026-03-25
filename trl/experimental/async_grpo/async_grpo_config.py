@@ -165,17 +165,6 @@ class AsyncGRPOConfig(_BaseConfig):
         metadata={"help": "Upper-bound epsilon value for clipping."},
     )
 
-    # Parameters that control the LM head
-    chunk_lm_head_size: int | None = field(
-        default=8192,
-        metadata={
-            "help": "Chunk size for the fused LM head. When set, the lm_head computes log-probs and entropy "
-            "without materializing the full [batch, seq, vocab] logits tensor, processing the vocabulary in "
-            "chunks of this size instead. Reduces peak memory at the cost of extra matmuls. If None, uses "
-            "the standard full-logits path. Incompatible with `use_liger_kernel` (both replace the LM head "
-            "forward pass)."
-        },
-    )
     # Parameters that control the async rollout pipeline
     max_inflight_tasks: int = field(
         default=-1,
