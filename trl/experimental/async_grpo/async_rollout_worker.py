@@ -574,8 +574,6 @@ class AsyncRolloutWorker:
         )
 
         iteration_num = 0
-        # context_messages for the current turn: initial prompt for turn 0, tool results for turn N>0
-        context_messages: Messages = list(prompt)
         while True:
             t_gen = time.monotonic()
             turn_ids, turn_logprobs = await self._generate_one_turn(prompt_ids)
@@ -583,9 +581,15 @@ class AsyncRolloutWorker:
 
             assistant_message = parse_response(self.tokenizer, turn_ids)
             tool_calls_raw = assistant_message.get("tool_calls")
+            reached_max_turns = (
+                max_num_turns is not None and iteration_num >= max_num_turns and tool_calls_raw is not None
+            )
 
-            if tool_calls_raw is None or (max_num_turns is not None and iteration_num >= max_num_turns):
-                messages = [TaggedMessage(m, is_completion=False) for m in context_messages]
+            if tool_calls_raw is None or reached_max_turns:
+                # Prompt context only in first turn; subsequent turns store only new messages
+                messages: list[TaggedMessage] = []
+                if not turns:
+                    messages.extend(TaggedMessage(m, is_completion=False) for m in prompt)
                 messages.append(TaggedMessage(assistant_message, is_completion=True))
                 turns.append(
                     TurnRecord(
@@ -598,14 +602,17 @@ class AsyncRolloutWorker:
                         tool_execution_duration_s=0.0,
                     )
                 )
-                return _build_completion(turns, truncated=False, total_duration=time.monotonic() - t_start)
+                return _build_completion(turns, truncated=reached_max_turns, total_duration=time.monotonic() - t_start)
 
             t_tools = time.monotonic()
             tool_call_records, tool_messages = self._execute_tool_calls(tool_calls_raw, tool_dict)
             tool_execution_duration = time.monotonic() - t_tools
 
             tool_suffix_ids = self._build_messages_suffix_ids(tool_messages)
-            messages = [TaggedMessage(m, is_completion=False) for m in context_messages]
+            # Prompt context only in first turn; subsequent turns store only new messages
+            messages = []
+            if not turns:
+                messages.extend(TaggedMessage(m, is_completion=False) for m in prompt)
             messages.append(TaggedMessage(assistant_message, is_completion=True))
             messages.extend(TaggedMessage(m, is_completion=True) for m in tool_messages)
             turns.append(
@@ -619,7 +626,6 @@ class AsyncRolloutWorker:
                     tool_execution_duration_s=tool_execution_duration,
                 )
             )
-            context_messages = list(tool_messages)
 
             prompt_ids = prompt_ids + turn_ids + tool_suffix_ids
 
