@@ -46,10 +46,9 @@ jobs:
         python-version: ['3.10', '3.11', '3.12', '3.13', '3.14']
       fail-fast: false
     runs-on:
-      group: aws-g4dn-2xlarge
+      group: aws-g4dn-2xlarge-plus
     container:
       image: pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel
-      options: --gpus all
     defaults:
       run:
         shell: bash
@@ -98,10 +97,9 @@ jobs:
   tests_dev:
     name: Tests with dev dependencies
     runs-on:
-      group: aws-g4dn-2xlarge
+      group: aws-g4dn-2xlarge-plus
     container:
       image: pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel
-      options: --gpus all
     defaults:
       run:
         shell: bash
@@ -154,10 +152,9 @@ jobs:
   tests_wo_optional_deps:
     name: Tests without optional dependencies
     runs-on:
-      group: aws-g4dn-2xlarge
+      group: aws-g4dn-2xlarge-plus
     container:
       image: pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel
-      options: --gpus all
     defaults:
       run:
         shell: bash
@@ -206,10 +203,9 @@ jobs:
   tests_min_versions:
     name: Tests with minimum versions
     runs-on:
-      group: aws-g4dn-2xlarge
+      group: aws-g4dn-2xlarge-plus
     container:
       image: pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel
-      options: --gpus all
     defaults:
       run:
         shell: bash
@@ -264,7 +260,6 @@ jobs:
       group: aws-g5-12xlarge-cache
     container:
       image: pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel
-      options: --gpus all
     defaults:
       run:
         shell: bash
