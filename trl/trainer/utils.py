@@ -693,6 +693,8 @@ def print_prompt_completions_sample(
                         t.append(f"{fn.get('name', '?')}({args_str})")
                 if j < len(entry) - 1:
                     t.append("\n\n")
+        else:
+            t.append(str(entry))
         return t
 
     # Some basic input validation
