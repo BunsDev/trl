@@ -56,7 +56,7 @@ from trl import GRPOConfig, GRPOTrainer
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run GRPO VLM training with CARLA environment.")
-    parser.add_argument("--model", type=str, default="Qwen/Qwen3.5-2B")
+    parser.add_argument("--model", type=str, default="Qwen/Qwen3.5-0.8B")
     parser.add_argument(
         "--env-urls",
         type=str,
@@ -65,10 +65,10 @@ def parse_args():
         help="URLs for CARLA environment servers. At least 2 required (1 Space = 1 connection).",
     )
     parser.add_argument("--dataset-size", type=int, default=1000)
-    parser.add_argument("--max-completion-length", type=int, default=2048)
+    parser.add_argument("--max-completion-length", type=int, default=4096)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
     parser.add_argument("--max-steps", type=int, default=100)
-    parser.add_argument("--image-size", type=int, default=512, help="Resize camera images to this size. 0 to disable.")
+    parser.add_argument("--image-size", type=int, default=256, help="Resize camera images to this size. 0 to disable.")
     parser.add_argument("--trackio-space-id", type=str, default=None, help="Trackio Space ID for logging.")
     parser.add_argument("--hub-model-id", type=str, default=None)
     parser.add_argument("--run-name", type=str, default=None)
