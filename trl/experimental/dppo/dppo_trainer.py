@@ -343,6 +343,7 @@ class DPPOTrainer(GRPOTrainer):
             gen_config = shallow_copy(self.generation_config)
             gen_config.output_logits = True
             gen_config.return_dict_in_generate = True
+            gen_config.disable_compile = True
 
             with (
                 profiling_context(self, "transformers.generate"),
@@ -355,9 +356,7 @@ class DPPOTrainer(GRPOTrainer):
                 torch.no_grad(),
                 FSDP.summon_full_params(self.model_wrapped, recurse=False) if self.is_fsdp_enabled else nullcontext(),
             ):
-                gen_output = unwrapped_model.generate(
-                    **generate_inputs, generation_config=gen_config, disable_compile=True
-                )
+                gen_output = unwrapped_model.generate(**generate_inputs, generation_config=gen_config)
 
             prompt_ids_tensor, prompt_mask = generate_inputs["input_ids"], generate_inputs["attention_mask"]
             prompt_length = prompt_ids_tensor.size(1)
