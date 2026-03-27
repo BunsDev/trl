@@ -343,7 +343,6 @@ class DPPOTrainer(GRPOTrainer):
             gen_config = shallow_copy(self.generation_config)
             gen_config.output_logits = True
             gen_config.return_dict_in_generate = True
-            gen_config.disable_compile = True
 
             with (
                 profiling_context(self, "transformers.generate"),
