@@ -17,7 +17,6 @@ import subprocess
 from pathlib import Path
 
 import pytest
-import torch
 import transformers
 from packaging.version import Version
 
@@ -153,24 +152,7 @@ class TestDistributed(
 
     @pytest.mark.parametrize(
         "config",
-        [
-            "ddp",
-            pytest.param(
-                "zero2",
-                marks=pytest.mark.xfail(
-                    condition=Version("2.10") <= Version(torch.__version__),
-                    reason="ZeRO 2 + PEFT is failing on torch 2.10; see #4884",
-                ),
-            ),
-            pytest.param(
-                "zero3",
-                marks=pytest.mark.xfail(
-                    condition=Version("2.10") <= Version(torch.__version__),
-                    reason="ZeRO 3 + PEFT is failing on torch 2.10; see #4884",
-                ),
-            ),
-            "fsdp2",
-        ],
+        ["ddp", "zero2", "zero3", "fsdp2"],
     )
     def test_sft_peft(self, config, get_config_path):
         # fmt: off
