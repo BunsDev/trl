@@ -347,8 +347,8 @@ class RLOOTrainer(_BaseTrainer):
 
         self._has_async_reward_funcs = any(inspect.iscoroutinefunction(func) for func in self.reward_funcs)
         if self._has_async_reward_funcs:
-            self.async_loop_thread, self.async_loop, self.async_loop_ready_event = (
-                start_event_loop_in_daemon(name="RLOOTrainer-AsyncRewardLoop")
+            self.async_loop_thread, self.async_loop, self.async_loop_ready_event = start_event_loop_in_daemon(
+                name="RLOOTrainer-AsyncRewardLoop"
             )
             # wait until the event loop is running in the daemon thread
             self.async_loop_ready_event.wait()
@@ -417,9 +417,10 @@ class RLOOTrainer(_BaseTrainer):
 
         self.tools = tools
 
-        # Check for async tool functions to start an event loop on a daemon thread
-        self._has_async_tools = any(inspect.iscoroutinefunction(tool) for tool in self.tools)
-        if self._has_async_tools:
+        # Check for async functions to start an event loop on a daemon thread
+        self._has_async_funcs = any(inspect.iscoroutinefunction(func) for func in self.tools)
+
+        if self._has_async_funcs:
             self.async_loop_thread, self.async_loop, self.async_loop_ready_event = start_event_loop_in_daemon(
                 name="RLOOTrainer-AsyncLoop"
             )
@@ -1093,7 +1094,7 @@ class RLOOTrainer(_BaseTrainer):
                 c[m].tolist() for c, m in zip(completion_ids.cpu(), completion_mask.bool().cpu(), strict=True)
             ]
 
-        return completion_ids, None  # logprobs are not used in RLOO
+        return completion_ids
 
     def _get_tool_suffix_ids(self, tool_messages):
         """Get token IDs for tool result formatting by using a minimal dummy conversation."""
@@ -1245,9 +1246,7 @@ class RLOOTrainer(_BaseTrainer):
             )
 
             # Generate new completions after tool execution (using concatenated IDs, no re-tokenization)
-            post_tool_ids, post_tool_logprobs = self._generate_single_turn(
-                prompt_completion_tool_ids, loop_images, loop_multimodal_fields
-            )
+            post_tool_ids = self._generate_single_turn(prompt_completion_tool_ids, loop_images, loop_multimodal_fields)
 
             # Truncate so that pct[len(prompt_ids[idx]) :] + post_tool does not exceed max_completion_length
             for idx in range(len(idxs_with_tool)):
@@ -1258,8 +1257,6 @@ class RLOOTrainer(_BaseTrainer):
                 if excess_length > 0:
                     # If exceeding max length, truncate post_tool_ids
                     post_tool_ids[idx] = post_tool_ids[idx][:-excess_length]
-                    if logprobs is not None:
-                        post_tool_logprobs[idx] = post_tool_logprobs[idx][:-excess_length]
                     excess_length = len(completion_tool_ids) + len(post_tool_ids[idx]) - self.max_completion_length
                     if excess_length > 0:
                         # If still exceeding max length, truncate completion_tool_ids as well
@@ -1274,8 +1271,6 @@ class RLOOTrainer(_BaseTrainer):
                 post_tool_length = len(post_tool_ids[idx])
                 tool_length = prompt_completion_tool_length - prompt_length - completion_length
                 tool_mask[idx_with_tool] += [0] * tool_length + [1] * post_tool_length
-                if logprobs is not None:
-                    logprobs[idx_with_tool] += [0.0] * tool_length + post_tool_logprobs[idx]
 
             # Update completion_ids with the new completions (after tool execution)
             for idx in range(len(idxs_with_tool)):
