@@ -8,13 +8,12 @@
 name: PR Template Check
 
 on:
-  pull_request_target:
+  pull_request:
     types: [opened, edited, reopened]
 
 permissions:
   pull-requests: write
   issues: write
-  statuses: write
 
 jobs:
   check-pr-template:
@@ -62,7 +61,7 @@ jobs:
             }
 
             if (errors.length > 0) {
-              const comment = "Your PR has been closed because it does not follow the required [PR template](https://github.com/huggingface/trl/blob/main/.github/PULL_REQUEST_TEMPLATE.md). Please open a new PR following the template. See [CONTRIBUTING.md](https://github.com/huggingface/trl/blob/main/CONTRIBUTING.md#submitting-a-pull-request-pr) for guidance.";
+              const comment = "Your PR has been closed because it does not follow the required [PR template](https://github.com/huggingface/trl/blob/main/.github/PULL_REQUEST_TEMPLATE.md). Please open a new PR following the template. See [CONTRIBUTING.md](https://github.com/huggingface/trl/blob/main/CONTRIBUTING.md#submitting-a-pull-request-pr) for guidance.\n\n**Issues found:**\n" + errors.join("\n");
 
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
