@@ -1662,7 +1662,7 @@ class TestRLOOTrainer(TrlTestCase):
             output_dir=self.tmp_dir,
             learning_rate=0.1,  # use higher lr because gradients are tiny and default lr can stall updates
             per_device_train_batch_size=3,
-            rloo_k=3,
+            num_generations=3,
             max_completion_length=128,
             report_to="none",
         )
@@ -1746,7 +1746,7 @@ class TestRLOOTrainer(TrlTestCase):
             output_dir=self.tmp_dir,
             learning_rate=0.1,  # use higher lr because gradients are tiny and default lr can stall updates
             per_device_train_batch_size=3,
-            rloo_k=3,
+            num_generations=3,
             max_completion_length=128,
             report_to="none",
         )
