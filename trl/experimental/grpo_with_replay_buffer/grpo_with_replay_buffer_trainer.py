@@ -104,6 +104,7 @@ class GRPOWithReplayBufferTrainer(GRPOTrainer):
             num_items_in_batch,
             sampling_per_token_logps_list,
             extra_fields,
+            images,
         ) = self._generate(prompts)
 
         # Convert lists of token IDs to padded tensors

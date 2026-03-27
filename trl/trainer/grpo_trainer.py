@@ -1625,6 +1625,8 @@ class GRPOTrainer(_BaseTrainer):
 
             # Filter samples whose length exceeds max allowed length. This is important, because both
             # vLLM and transformers will error out if the input is longer than the model's max length.
+            # Note: _truncate_at_image_boundary ensures we never cut in the middle of an image token
+            # sequence (vision_start...vision_end), which would cause pixel_values/input_ids mismatches.
             if self.use_vllm and self.vllm_mode == "colocate":
                 max_model_len = self.vllm_generation.llm.llm_engine.model_config.max_model_len
             elif self.use_vllm and self.vllm_mode == "server":
@@ -1723,11 +1725,10 @@ class GRPOTrainer(_BaseTrainer):
                 pct = prompt_completion_tool_ids[idx]  # = prompt-completion-tool
                 completion_ids[idx_with_tool] = pct[prompt_length:] + post_tool_ids[idx]
 
-            # Decode post-tool completions. Use tokenizer for parsing (processors don't have parse_response).
-            parsing_class = self.processing_class
-            if self._is_vlm:
-                parsing_class = parsing_class.tokenizer
-            post_tool_completions = [parse_response(parsing_class, ids) if ids else {} for ids in post_tool_ids]
+            # Decode post-tool completions.
+            post_tool_completions = [
+                parse_response(self.processing_class, ids) if ids else {} for ids in post_tool_ids
+            ]
 
             # Add post-tool completions to the existing completions
             for idx in range(len(idxs_with_tool)):
@@ -1798,21 +1799,21 @@ class GRPOTrainer(_BaseTrainer):
             extra_fields = {}
 
         # Decode completions. It's important to use `parse_response` when possible, because it handles tool calls.
-        # For VLM processors, delegate to the inner tokenizer for parsing (parse_response lives on the tokenizer).
         if is_conversational({"prompt": prompts[0]}):
             parsing_class = self.processing_class
+            # For VLM processors, propagate response_schema to the inner tokenizer if needed
             if self._is_vlm:
-                # Propagate response_schema from processor to tokenizer if needed
                 if getattr(self.processing_class, "response_schema", None) and not getattr(
-                    parsing_class.tokenizer, "response_schema", None
+                    self.processing_class.tokenizer, "response_schema", None
                 ):
-                    parsing_class.tokenizer.response_schema = self.processing_class.response_schema
-                parsing_class = parsing_class.tokenizer
+                    self.processing_class.tokenizer.response_schema = self.processing_class.response_schema
+            # parse_response handles VLM processors internally (uses inner tokenizer)
+            tokenizer = getattr(parsing_class, "tokenizer", parsing_class)
             if (
                 Version(transformers.__version__) >= Version("5.0.0")  # parse_response added in v5
-                and isinstance(parsing_class, PreTrainedTokenizerBase)
-                and hasattr(parsing_class, "response_schema")  # attribute not set by default for now
-                and parsing_class.response_schema is not None  # only works if the tokenizer has a schema
+                and isinstance(tokenizer, PreTrainedTokenizerBase)
+                and hasattr(tokenizer, "response_schema")  # attribute not set by default for now
+                and tokenizer.response_schema is not None  # only works if the tokenizer has a schema
             ):
                 completions = [[parse_response(parsing_class, ids)] for ids in completion_ids]
             else:
