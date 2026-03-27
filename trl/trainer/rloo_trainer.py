@@ -404,8 +404,8 @@ class RLOOTrainer(_BaseTrainer):
                     "it with `pip install jmespath` to use this feature."
                 )
 
-        tools = tools or []
         generation_batch_size = args.per_device_train_batch_size * args.steps_per_generation
+        tools = tools or []
         self._sync_tool_dicts = [{} for _ in range(generation_batch_size)]
         self._async_tool_dicts = [{} for _ in range(generation_batch_size)]
         for i in range(generation_batch_size):
@@ -1018,7 +1018,7 @@ class RLOOTrainer(_BaseTrainer):
                     self.vllm_generation.sync_weights()
                 self._last_loaded_step = self.state.global_step
 
-            # Generate using vLLM (note: RLOO doesn't use logprobs from generation, so we ignore them)
+            # Generate using vLLM with raw token IDs
             num_generations = self.num_generations if mode == "train" else self.num_generations_eval
             _, completion_ids, _, _ = self.vllm_generation.generate(
                 prompts=prompt_ids,
@@ -1442,7 +1442,6 @@ class RLOOTrainer(_BaseTrainer):
         completion_mask = pad(
             completion_mask, padding_value=0, padding_side="right", pad_to_multiple_of=self.pad_to_multiple_of
         ).to(device=device)
-
         if tool_mask_list is not None:
             tool_mask = [torch.tensor(mask) for mask in tool_mask_list]
             tool_mask = pad(
