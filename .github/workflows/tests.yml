@@ -48,7 +48,7 @@ jobs:
     runs-on:
       group: aws-g4dn-2xlarge-plus
     container:
-      image: pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel
+      image: pytorch/pytorch:2.11.0-cuda12.8-cudnn9-devel
     defaults:
       run:
         shell: bash
@@ -99,7 +99,7 @@ jobs:
     runs-on:
       group: aws-g4dn-2xlarge-plus
     container:
-      image: pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel
+      image: pytorch/pytorch:2.11.0-cuda12.8-cudnn9-devel
     defaults:
       run:
         shell: bash
@@ -154,7 +154,7 @@ jobs:
     runs-on:
       group: aws-g4dn-2xlarge-plus
     container:
-      image: pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel
+      image: pytorch/pytorch:2.11.0-cuda12.8-cudnn9-devel
     defaults:
       run:
         shell: bash
@@ -205,7 +205,7 @@ jobs:
     runs-on:
       group: aws-g4dn-2xlarge-plus
     container:
-      image: pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel
+      image: pytorch/pytorch:2.11.0-cuda12.8-cudnn9-devel
     defaults:
       run:
         shell: bash
@@ -259,7 +259,7 @@ jobs:
     runs-on:
       group: aws-g5-12xlarge-cache
     container:
-      image: pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel
+      image: pytorch/pytorch:2.11.0-cuda12.8-cudnn9-devel
     defaults:
       run:
         shell: bash
