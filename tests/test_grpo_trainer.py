@@ -1971,7 +1971,6 @@ class TestGRPOTrainer(TrlTestCase):
         params_to_skip = (
             "model.vision_tower.",
             "model.multi_modal_projector.",
-            "model.vision_model.",
             "model.visual.",
             "model.image_newline",
         )
