@@ -1125,7 +1125,7 @@ class RLOOTrainer(_BaseTrainer):
 
         return full_ids[len(prefix_ids) :]
 
-    def _tool_call_loop(self, prompts, prompt_ids, completion_ids, completions, logprobs, images, multimodal_fields):
+    def _tool_call_loop(self, prompts, prompt_ids, completion_ids, completions, images, multimodal_fields):
         # Tool execution loop: execute tools, then regenerate completions with tool results appended to the prompt
         tool_calls = [completion[0].get("tool_calls") for completion in completions]
         idxs_with_tool = [idx for idx, tool_call in enumerate(tool_calls) if tool_call]
@@ -1228,8 +1228,6 @@ class RLOOTrainer(_BaseTrainer):
                     ct = prompt_completion_tool_ids[idx][prompt_length : prompt_length + self.max_completion_length]
                     completion_ids[idx_with_tool] = ct
                     tool_mask[idx_with_tool] += [1] * (len(ct) - len(tool_mask[idx_with_tool]))
-                    if logprobs is not None:
-                        logprobs[idx_with_tool] += [0.0] * (len(ct) - len(logprobs[idx_with_tool]))
             # Keep only non-overlong items for further processing
             idxs_with_tool = [idx for idx, o in zip(idxs_with_tool, overlong, strict=True) if not o]
             prompt_completion_tools = [pct for pct, o in zip(prompt_completion_tools, overlong, strict=True) if not o]
@@ -1296,7 +1294,7 @@ class RLOOTrainer(_BaseTrainer):
             tool_calls = [tool_call for tool_call in tool_calls if tool_call]
             iteration_num += 1
 
-        return tool_mask, completions, completion_ids, logprobs, tool_call_count, tool_failure_count
+        return tool_mask, completions, completion_ids, tool_call_count, tool_failure_count
 
     def _generate(self, prompts: list):
         device = self.accelerator.device
@@ -1306,7 +1304,7 @@ class RLOOTrainer(_BaseTrainer):
         prompts = copy.deepcopy(prompts)
 
         prompt_ids, images, multimodal_fields = self._tokenize_prompts(prompts)
-        completion_ids, logprobs = self._generate_single_turn(prompt_ids, images, multimodal_fields)
+        completion_ids = self._generate_single_turn(prompt_ids, images, multimodal_fields)
 
         # Decode completions. It's important to use `parse_response` when possible, because it handles tool calls.
         if is_conversational({"prompt": prompts[0]}):
@@ -1329,12 +1327,9 @@ class RLOOTrainer(_BaseTrainer):
                 tool_mask,
                 completions,
                 completion_ids,
-                logprobs,
                 tool_call_count,
                 tool_failure_count,
-            ) = self._tool_call_loop(
-                prompts, prompt_ids, completion_ids, completions, logprobs, images, multimodal_fields
-            )
+            ) = self._tool_call_loop(prompts, prompt_ids, completion_ids, completions, images, multimodal_fields)
         else:
             tool_mask = None
 
